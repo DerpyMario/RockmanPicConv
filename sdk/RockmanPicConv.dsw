@@ -1,0 +1,16 @@
+Microsoft Developer Studio Workspace File, Format Version 6.00
+# WARNING: DO NOT EDIT OR DELETE THIS WORKSPACE FILE!
+# If you rename the project file, also update the Project lines below.
+
+Project: "RockmanPicConv"= "RockmanPicConv.dsp" - Package Owner: 0
+Project: "pcp_parse"= "pcp_parse.dsp" - Package Owner: 0
+Global:
+	GlobalSection(SolutionConfiguration) = preSolution
+		Debug|Win32 = Debug|Win32
+		Release|Win32 = Release|Win32
+	EndGlobalSection
+	GlobalSection(ProjectDependencies) = postSolution
+	EndGlobalSection
+	GlobalSection(ExtensibilityGlobals) = postSolution
+	EndGlobalSection
+EndGlobal
