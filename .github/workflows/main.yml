@@ -18,8 +18,13 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [ubuntu-latest, windows-latest]
-        dotnet-version: ['8.0.x']
+        include:
+          - os: ubuntu-latest
+            dotnet-version: '8.0.x'
+            rid: linux-x64
+          - os: windows-latest
+            dotnet-version: '8.0.x'
+            rid: win-x64
 
     steps:
       - name: Checkout
@@ -40,20 +45,34 @@ jobs:
         if: ${{ github.event.inputs['run-tests'] != 'false' }}
         run: dotnet test --configuration ${{ github.event.inputs.configuration || 'Release' }} --no-build --verbosity normal
 
-      - name: Publish pactool
+      - name: Publish pactool (Linux)
+        if: runner.os == 'Linux'
         run: |
           # Try publishing the project in PacTool/ first (repository layout uses a PacTool directory)
           if [ -f PacTool/PacTool.csproj ]; then
-            dotnet publish PacTool/PacTool.csproj -c ${{ github.event.inputs.configuration || 'Release' }} -o out/publish
+            dotnet publish PacTool/PacTool.csproj -c ${{ github.event.inputs.configuration || 'Release' }} -r ${{ matrix.rid }} --self-contained true -p:PublishSingleFile=true -o out/publish
           elif [ -f PacTool.csproj ]; then
-            dotnet publish PacTool.csproj -c ${{ github.event.inputs.configuration || 'Release' }} -o out/publish
+            dotnet publish PacTool.csproj -c ${{ github.event.inputs.configuration || 'Release' }} -r ${{ matrix.rid }} --self-contained true -p:PublishSingleFile=true -o out/publish
           else
             echo "No PacTool project file found; skipping publish."
           fi
+
+      - name: Publish pactool (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # Try publishing the project in PacTool/ first (repository layout uses a PacTool directory)
+          if (Test-Path 'PacTool\\PacTool.csproj') {
+            dotnet publish 'PacTool\\PacTool.csproj' -c ${{ github.event.inputs.configuration || 'Release' }} -r ${{ matrix.rid }} --self-contained true -p:PublishSingleFile=true -o out/publish
+          } elseif (Test-Path 'PacTool.csproj') {
+            dotnet publish 'PacTool.csproj' -c ${{ github.event.inputs.configuration || 'Release' }} -r ${{ matrix.rid }} --self-contained true -p:PublishSingleFile=true -o out/publish
+          } else {
+            Write-Output 'No PacTool project file found; skipping publish.'
+          }
 
       - name: Upload published artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pactool-${{ matrix.os }}
+          name: pactool-${{ matrix.os }}-${{ matrix.rid }}
           path: out/publish
