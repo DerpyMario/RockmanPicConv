@@ -1,0 +1,59 @@
+name: .NET 8 CI
+
+on:
+  workflow_dispatch:
+    inputs:
+      configuration:
+        description: 'Build configuration (Debug or Release)'
+        required: false
+        default: 'Release'
+      run-tests:
+        description: 'Run tests (true/false)'
+        required: false
+        default: 'true'
+
+jobs:
+  build:
+    name: Build on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        dotnet-version: ['8.0.x']
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v3
+        with:
+          dotnet-version: ${{ matrix.dotnet-version }}
+
+      - name: Restore
+        run: dotnet restore
+
+      - name: Build
+        run: dotnet build --configuration ${{ github.event.inputs.configuration || 'Release' }} --no-restore
+
+      - name: Test
+        if: ${{ github.event.inputs['run-tests'] != 'false' }}
+        run: dotnet test --configuration ${{ github.event.inputs.configuration || 'Release' }} --no-build --verbosity normal
+
+      - name: Publish pactool
+        run: |
+          # Try publishing the project in PacTool/ first (repository layout uses a PacTool directory)
+          if [ -f PacTool/PacTool.csproj ]; then
+            dotnet publish PacTool/PacTool.csproj -c ${{ github.event.inputs.configuration || 'Release' }} -o out/publish
+          elif [ -f PacTool.csproj ]; then
+            dotnet publish PacTool.csproj -c ${{ github.event.inputs.configuration || 'Release' }} -o out/publish
+          else
+            echo "No PacTool project file found; skipping publish."
+          fi
+
+      - name: Upload published artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pactool-${{ matrix.os }}
+          path: out/publish
