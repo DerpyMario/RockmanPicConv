@@ -56,10 +56,12 @@ public sealed class SceneTable
     }
 
     /// <summary>Named entries only, in stored order.</summary>
-    public IEnumerable<SceneRecord> Entries => Records.Where(r => r.Kind is SceneRecordKind.Entry or SceneRecordKind.Shape);
+    public IEnumerable<SceneRecord> Entries =>
+        Records.Where(r => r.Kind is SceneRecordKind.Entry or SceneRecordKind.Shape or SceneRecordKind.SkinnedShape);
 
-    /// <summary>Shape entries only, in stored order.</summary>
-    public IEnumerable<SceneRecord> Shapes => Records.Where(r => r.Kind == SceneRecordKind.Shape);
+    /// <summary>Shape entries of either encoding, in stored order.</summary>
+    public IEnumerable<SceneRecord> Shapes =>
+        Records.Where(r => r.Kind is SceneRecordKind.Shape or SceneRecordKind.SkinnedShape);
 
     /// <summary>Parses the table at <paramref name="data"/>.</summary>
     public static SceneTable Parse(ReadOnlySpan<byte> data, int offset)
@@ -91,29 +93,15 @@ public sealed class SceneTable
             // the value 15.0, otherwise looks like a name field holding "Ap".
             if (Ascii.IsPrintableName(record[4..12], minimumLength: 3))
             {
-                int streamBytes = BinaryPrimitives.ReadUInt16BigEndian(record[0x16..]);
-                int listBytes = BinaryPrimitives.ReadUInt16BigEndian(record[0x1A..]);
-                int vertices = BinaryPrimitives.ReadUInt16BigEndian(record[0x1C..]);
-                int triangles = BinaryPrimitives.ReadUInt16BigEndian(record[0x1E..]);
-                bool isShape = streamBytes == listBytes + RecordSize && vertices > 0 &&
-                               streamBytes > 0 && at + RecordSize + streamBytes <= data.Length;
-
                 FlushPayload(data, records, ref payloadStart, at);
-                var entry = new SceneRecord
-                {
-                    Offset = at,
-                    Kind = isShape ? SceneRecordKind.Shape : SceneRecordKind.Entry,
-                    Name = Ascii.Decode(record[4..12]),
-                    Tag = Ascii.IsPrintableName(record[12..16]) ? Ascii.Decode(record[12..16]) : "",
-                    Field00 = BinaryPrimitives.ReadUInt32BigEndian(record),
-                    Field14 = Ascii.IsAllZero(record[20..24]) ? null : record[20..24].ToArray(),
-                    VertexCount = isShape ? vertices : 0,
-                    TriangleCount = isShape ? triangles : 0,
-                    DisplayList = isShape ? data.Slice(at + RecordSize, streamBytes).ToArray() : null,
-                    Raw = record.ToArray(),
-                };
+                SceneRecord entry = ReadEntry(data, at, record);
                 records.Add(entry);
-                at += RecordSize + (isShape ? streamBytes : 0);
+
+                // Records sit on 32-byte boundaries. A display list is padded up to one already,
+                // but a skinned body ends wherever its last vertex does, so the walk has to
+                // re-align: m01xxxxx.scn's first shape ends at 0x78EA and the next record is at
+                // 0x7900.
+                at = RoundUpTo32(at + RecordSize + (entry.Geometry?.Length ?? 0));
                 continue;
             }
 
@@ -125,6 +113,85 @@ public sealed class SceneTable
         FlushPayload(data, records, ref payloadStart, data.Length / RecordSize * RecordSize);
         return new SceneTable(offset, data.ToArray(), records);
     }
+
+    /// <summary>
+    /// Reads a named record, working out whether it introduces geometry and, if so, how much.
+    ///
+    /// The two encodings put their fields in different places, so the word at 0x00 decides which
+    /// to read: it is 1 on a character model's shapes and 0 everywhere else. Both readings are
+    /// then checked for self-consistency, and a record that fails is kept as a plain entry rather
+    /// than being allowed to desynchronise the walk.
+    /// </summary>
+    private static SceneRecord ReadEntry(ReadOnlySpan<byte> data, int at, ReadOnlySpan<byte> record)
+    {
+        uint field00 = BinaryPrimitives.ReadUInt32BigEndian(record);
+        var entry = new SceneRecord
+        {
+            Offset = at,
+            Kind = SceneRecordKind.Entry,
+            Name = Ascii.Decode(record[4..12]),
+            Tag = Ascii.IsPrintableName(record[12..16]) ? Ascii.Decode(record[12..16]) : "",
+            Field00 = field00,
+            Field14 = Ascii.IsAllZero(record[20..24]) ? null : record[20..24].ToArray(),
+            Raw = record.ToArray(),
+        };
+
+        if (field00 == SkinnedShapeMarker)
+        {
+            // A character model's shape:
+            //   0x14 u16 vertices   0x16 u16 triangles   0x18 u16 strips   0x1E u16 body bytes
+            int vertices = BinaryPrimitives.ReadUInt16BigEndian(record[0x14..]);
+            int triangles = BinaryPrimitives.ReadUInt16BigEndian(record[0x16..]);
+            int strips = BinaryPrimitives.ReadUInt16BigEndian(record[0x18..]);
+            long size = ScnMesh.SkinnedBodySize(vertices, strips);
+
+            // The stated size is 16-bit and the game does not clamp it, so it is only trusted as a
+            // check on the size computed from the counts.
+            bool sound = vertices > 0 && strips > 0 && vertices - 2 * strips == triangles &&
+                         (size & 0xFFFF) == BinaryPrimitives.ReadUInt16BigEndian(record[0x1E..]) &&
+                         at + RecordSize + size <= data.Length;
+            if (!sound)
+                return entry;
+
+            entry.Kind = SceneRecordKind.SkinnedShape;
+            entry.VertexCount = vertices;
+            entry.TriangleCount = triangles;
+            entry.PrimitiveCount = strips;
+            entry.Geometry = data.Slice(at + RecordSize, (int)size).ToArray();
+            return entry;
+        }
+
+        // A display list shape:
+        //   0x16 u16 stream bytes   0x1A u16 list bytes   0x1C u16 vertices   0x1E u16 triangles
+        int streamBytes = BinaryPrimitives.ReadUInt16BigEndian(record[0x16..]);
+        int listBytes = BinaryPrimitives.ReadUInt16BigEndian(record[0x1A..]);
+        int listVertices = BinaryPrimitives.ReadUInt16BigEndian(record[0x1C..]);
+        int listTriangles = BinaryPrimitives.ReadUInt16BigEndian(record[0x1E..]);
+        if (streamBytes != ((listBytes + RecordSize) & 0xFFFF) || listVertices == 0)
+            return entry;
+
+        int resolved = ScnMesh.ResolveStreamLength(data, at + RecordSize, listBytes, listVertices, listTriangles);
+        if (resolved <= 0)
+        {
+            // Nothing walked. Fall back to the stated length so the rest of the table still lines
+            // up, and let the caller report that the geometry did not decode.
+            if (streamBytes == 0 || at + RecordSize + streamBytes > data.Length)
+                return entry;
+            resolved = streamBytes;
+        }
+
+        entry.Kind = SceneRecordKind.Shape;
+        entry.VertexCount = listVertices;
+        entry.TriangleCount = listTriangles;
+        entry.Geometry = data.Slice(at + RecordSize, resolved).ToArray();
+        return entry;
+    }
+
+    /// <summary>The word at 0x00 that marks a character model's shape record.</summary>
+    private const uint SkinnedShapeMarker = 1;
+
+    /// <summary>Rounds up to the record alignment.</summary>
+    private static int RoundUpTo32(int value) => (value + RecordSize - 1) / RecordSize * RecordSize;
 
     /// <summary>Closes off a run of unrecognised records.</summary>
     private static void FlushPayload(ReadOnlySpan<byte> data, List<SceneRecord> records,
@@ -175,17 +242,26 @@ public sealed class SceneTable
                 }
 
                 case SceneRecordKind.Shape:
+                case SceneRecordKind.SkinnedShape:
                 {
                     var detail = new StringBuilder($"'{record.Name}'");
                     if (record.Tag.Length > 0)
                         detail.Append($"  lod={record.Tag}");
                     detail.Append($"  {record.VertexCount} vert, {record.TriangleCount} tri");
-                    detail.Append($"  {record.DisplayList!.Length:N0} B display list");
+                    detail.Append($"  {record.Geometry!.Length:N0} B");
                     if (record.Mesh is { } mesh)
-                        detail.Append($"  [{mesh.FormatName}, {mesh.Format.VertexSize} B/vertex]");
+                    {
+                        detail.Append($"  [{mesh.Description}]");
+                        if (mesh.Joints.Count > 0)
+                            detail.Append($"  joints {string.Join(",", mesh.Joints)}");
+                    }
                     else
-                        detail.Append("  [vertex layout not identified]");
-                    text.AppendLine($"  0x{record.Offset:X6}  shape     {detail}");
+                    {
+                        detail.Append("  [not decoded]");
+                    }
+
+                    string kind = record.Kind == SceneRecordKind.SkinnedShape ? "skinned  " : "shape    ";
+                    text.AppendLine($"  0x{record.Offset:X6}  {kind} {detail}");
                     break;
                 }
 
@@ -212,6 +288,9 @@ public enum SceneRecordKind
     /// <summary>A named object followed by the GX display list that draws it.</summary>
     Shape,
 
+    /// <summary>A character model's shape, followed by skinned triangle strips rather than a display list.</summary>
+    SkinnedShape,
+
     /// <summary>Records that matched neither shape, kept verbatim.</summary>
     Payload,
 }
@@ -223,7 +302,7 @@ public sealed class SceneRecord
     public required int Offset { get; init; }
 
     /// <summary>How this record was classified.</summary>
-    public required SceneRecordKind Kind { get; init; }
+    public required SceneRecordKind Kind { get; set; }
 
     /// <summary>The record's bytes. For a payload run this is the whole run, not one record.</summary>
     public required byte[] Raw { get; init; }
@@ -247,15 +326,18 @@ public sealed class SceneRecord
     public byte[]? Field14 { get; init; }
 
     /// <summary>Vertices the shape record declares.</summary>
-    public int VertexCount { get; init; }
+    public int VertexCount { get; set; }
 
     /// <summary>Triangles the shape record declares.</summary>
-    public int TriangleCount { get; init; }
+    public int TriangleCount { get; set; }
 
-    /// <summary>The display list following a shape record, or null.</summary>
-    public byte[]? DisplayList { get; init; }
+    /// <summary>Strips a skinned shape record declares.</summary>
+    public int PrimitiveCount { get; set; }
 
-    /// <summary>Decoded geometry, set by <see cref="SceneTable"/>'s caller. Null when the layout was not identified.</summary>
+    /// <summary>The geometry stored after a shape record, or null.</summary>
+    public byte[]? Geometry { get; set; }
+
+    /// <summary>Decoded geometry, set by the caller. Null when it could not be decoded.</summary>
     public ScnMesh? Mesh { get; set; }
 
     /// <summary>A file-name-safe form of <see cref="Name"/> plus <see cref="Tag"/>.</summary>

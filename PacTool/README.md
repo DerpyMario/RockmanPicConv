@@ -38,7 +38,7 @@ Verified invariants across all 203 archives:
 
 ```
 dotnet build -c Release          # produces bin/Release/net8.0/pactool
-dotnet test                      # 152 tests, from the solution root
+dotnet test                      # 162 tests, from the solution root
 ```
 
 Targets .NET 8. The tool itself has **no external dependencies** — the GX texture decoders and the
@@ -103,16 +103,18 @@ Stage0b.pac: CAPR archive, 22 member(s)
   b0bstage.scn         Picture Pack, 3 texture(s) + 23,456 B scene table
     9 shape(s), 9 decoded to geometry, 1,352 triangle(s)
   l0blight.pcp         Picture Pack, 12 texture(s)
+  d2dxxxxx.scn         Picture Pack, 2 texture(s) + 14,048 B scene table
+    2 shape(s), 2 decoded to geometry (2 skinned), 464 triangle(s)
   d2dxxxxx.mpc         MPC model, 6 node(s), root 'chn5', 3,536 B mesh data
   ...
-Wrote 202 file(s) to .../out
-  51 image(s) and 88 mesh(es) decoded, 0 item(s) copied verbatim
+Wrote 242 file(s) to .../out
+  51 image(s) and 104 mesh(es) decoded, 0 item(s) copied verbatim
 ```
 
 | Input | Output |
 | --- | --- |
 | `.pac` | each member, decoded into its own directory |
-| `.pcp` / `.scn` | `textures/*.png` and `textures/textures.txt`; for `.scn`, `scene.txt`, `scene.bin`, `geometry/*.obj` and one combined `<name>.obj` |
+| `.pcp` / `.scn` | `textures/*.png` and `textures/textures.txt`; for `.scn`, `scene.txt`, `scene.bin`, `geometry/*.obj` (plus `.skin.csv` for character models) and one combined `<name>.obj` |
 | `.mpc` | `skeleton.txt`, `skeleton.bin`, `mesh.bin` |
 | `map.dat` / `bg.dat` / `enemy.dat` | `directory.txt` and `leveldata.bin` |
 | `.bmd` / `.bdl` | `model.txt`, `sections/*.bin`, `textures/*.png` |
@@ -184,18 +186,28 @@ texture header:
 
 The scene table of a `.scn` is a run of 32-byte records, classified by shape rather than by name:
 a **section header** (a count followed by thirty zero bytes), a **named entry** (a name at 0x04,
-plus an RGBA colour at 0x14 on material entries), or a **shape** — a named entry whose remaining
-fields describe the GX display list stored immediately after it:
+plus an RGBA colour at 0x14 on material entries), or a **shape** — a named entry followed by
+geometry. There are two encodings of geometry, and the word at 0x00 says which: 0 for a GX display
+list, 1 for the skinned strips a character model uses. Their fields sit in different places.
 
 ```
-0x16  u16  streamBytes    bytes of display list following this record, padding included
-0x1A  u16  listBytes      streamBytes - 32
-0x1C  u16  vertexCount
-0x1E  u16  triangleCount
+display list                      skinned strips
+0x16  u16  streamBytes            0x14  u16  vertexCount
+0x1A  u16  listBytes              0x16  u16  triangleCount
+0x1C  u16  vertexCount            0x18  u16  stripCount
+0x1E  u16  triangleCount          0x1E  u16  bodyBytes
 ```
 
-Those fields make the table walkable exactly rather than by scanning, since a shape's display list
-is skipped by its own stated length. They are also what identifies the vertex layout — see below.
+Either way the record states how much geometry follows, so the table is walked exactly rather than
+scanned for. A display list is already padded up to 32 bytes; a skinned body ends wherever its last
+vertex does, so the walk re-aligns after one — `m01xxxxx.scn`'s first shape ends at `0x78EA` and
+the next record is at `0x7900`.
+
+**The length fields are 16-bit and the game does not clamp them.** A shape with more than 64 KiB of
+geometry stores its length modulo 65,536: `b0cdfblk.scn`'s `atgallM3` is 111,328 bytes and states
+45,792. So a stated length is treated as a residue — the candidates are it plus any whole number of
+64 KiB, and the right one is whichever walks to the declared counts and ends where it claims. Ten
+shapes in the reference data need this.
 
 ### GX display lists and vertex layouts
 
@@ -236,18 +248,44 @@ thousands or the hundredths.
    that comes out as a denormal or in the thousands, means the layout is wrong. That settles the
    last **10**.
 
-**4 shapes** are left that no layout reproduces (`atgallM3`, `obj7M0`, and `jpihex1M` twice); their
-byte counts are not consistent with any whole vertex size. They are reported and skipped rather
-than guessed at.
+Every display-list shape in the reference data decodes under one of the two layouts.
+
+### Character models: skinned strips
+
+Character and enemy models do not use display lists at all — their bodies contain no GX opcodes
+anywhere. The geometry is a plain run of triangle strips, each a vertex count followed by that many
+20-byte vertices, so a body measures exactly `20 × vertices + 2 × strips`:
+
+```
+0x00  s16     u          texture coordinate, 8-bit fraction
+0x02  s16     v
+0x04  s16     x          position, 8-bit fraction
+0x06  s16     y
+0x08  s16     z
+0x0A  s8[3]   normal     6-bit fraction, as the hardware fixes for signed bytes
+0x0D  u8[3]   joints     indices into the skeleton of the .mpc with the same stem, 0xFF unused
+0x10  u8[3]   weights    in 1/128 units; the three sum to 128
+0x13  u8      padding    zero throughout
+```
+
+Confirmed across **634 shapes and 522,224 vertices**: every normal comes out unit length, every
+weight triple sums to 128 (or 127, or 126, where rounding lost a unit), and the byte at 0x13 is
+always zero. `m01xxxxx.scn` decodes to a figure 63 units tall, symmetric about x and standing on
+y ≈ 0, bound to joints 22–36 of a 37-joint skeleton.
+
+That joint reference is the load-bearing cross-check: the indices address the `.mpc` of the same
+stem, and 97% of them fall inside its node count. The exceptions are four shapes in `c16xxxxx.scn`
+and six whose `.mpc` is not in this data set, so the mapping is reported rather than asserted.
 
 Geometry is exported as Wavefront OBJ — one file per shape under `geometry/`, plus one combined
-file per container. Vertices are written exactly as the stream stores them, with no welding, so
-the file stays a record of the display list rather than an interpretation of it.
+file per container. Vertices are written exactly as stored, with no welding, so the file stays a
+record of the source rather than an interpretation of it. OBJ has nowhere to put skin weights, so a
+skinned shape also gets a `.skin.csv` beside it listing each vertex's joints and weights.
 
-**Character models are different.** The shape records in `c*xxxxx.scn` and `d*xxxxx.scn` set the
-word at 0x00 to 1 and carry no display list; their geometry is in some other, non-FIFO form that
-this tool does not decode. The `.mpc` mesh blob is likewise not a display list — no run of GX
-primitive opcodes appears anywhere in any of the 119 sampled files. Both are extracted verbatim.
+**The `.mpc` mesh blob is still not decoded.** It is not a display list — no run of GX primitive
+opcodes appears at any node's geometry offset across all 119 sampled files — and it is not skinned
+strips either. Given the skeleton it sits behind and the `MotionTest` directory it ships in,
+animation is the obvious guess, but it is a guess; the blob is extracted verbatim.
 
 ### MPC models (`.mpc`)
 
@@ -381,7 +419,7 @@ src/Formats/Ascii.cs            fixed-width name fields
 src/Formats/ContentSniffer.cs   works out what a payload is
 src/Formats/PicturePack.cs      .pcp / .scn texture container
 src/Formats/SceneTable.cs       the scene description a .scn appends
-src/Formats/ScnMesh.cs          shape geometry, and the layouts its display lists use
+src/Formats/ScnMesh.cs          shape geometry: display lists and skinned strips
 src/Formats/MpcModel.cs         .mpc skeleton and mesh data
 src/Formats/DataDirectory.cs    map.dat / bg.dat / enemy.dat
 src/Formats/J3dModel.cs         .bmd / .bdl
@@ -402,6 +440,9 @@ and the per-attribute size rules — were taken from these and then checked agai
   processor's own documentation: command processor registers, the FIFO command set, texture formats.
 - [*Nintendo GameCube Architecture Guide*](https://db.hfsplay.fr/files/2019/07/04/Architecture_Guide_SCQNknY.pdf)
   — how the pieces fit together, and where display lists sit in the pipeline.
+- [MeltyTool / FinModelUtility](https://github.com/MeltyPlayer/MeltyTool) — a second implementation
+  of GameCube model and display list reading, useful as a cross-check on the GX conventions. It
+  does not cover this game.
 - [Dolphin](https://github.com/dolphin-emu/dolphin) — `VideoCommon/CPMemory.h` for the exact
   bitfield positions, `VideoCommon/OpcodeDecoding.h` for the opcodes, and the `VertexLoader_*.h`
   size tables for what each attribute costs in each mode. Dolphin is the reason two apparent

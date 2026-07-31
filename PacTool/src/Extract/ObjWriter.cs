@@ -40,8 +40,12 @@ public static class ObjWriter
     {
         writer.WriteLine($"# {name}");
         writer.WriteLine($"# {mesh.Vertices.Count} vertices, {mesh.Triangles.Count} triangles, " +
-                         $"{mesh.DisplayList.Primitives.Count} GX primitive(s)");
-        writer.WriteLine($"# vertex layout: {mesh.Format.Describe()}");
+                         $"{mesh.PrimitiveCount} strip(s)");
+        writer.WriteLine($"# stored as {mesh.Description}");
+        if (mesh.Format is { } format)
+            writer.WriteLine($"# vertex layout: {format.Describe()}");
+        if (mesh.Joints.Count > 0)
+            writer.WriteLine($"# skinned to joint(s) {string.Join(", ", mesh.Joints)}; weights are in the .skin.csv beside this file");
         writer.WriteLine($"o {Sanitize(name)}");
 
         foreach (ScnVertex v in mesh.Vertices)
@@ -67,6 +71,30 @@ public static class ObjWriter
 
         writer.WriteLine();
     }
+
+    /// <summary>
+    /// Renders a skinned mesh's bindings as CSV. OBJ has nowhere to put them, and dropping them
+    /// would lose the only thing that ties a character's geometry to its skeleton.
+    /// </summary>
+    public static string DescribeSkin(ScnMesh mesh)
+    {
+        var text = new StringBuilder();
+        text.AppendLine("# joint indices address the skeleton of the .mpc with the same stem; weights sum to 1");
+        text.AppendLine("vertex,joint0,weight0,joint1,weight1,joint2,weight2");
+
+        IReadOnlyList<ScnSkinBinding> skin = mesh.Skin ?? [];
+        for (int i = 0; i < skin.Count; i++)
+        {
+            ScnSkinBinding b = skin[i];
+            text.AppendLine($"{i},{Cell(b.Joint0)},{F(b.Weight0)},{Cell(b.Joint1)},{F(b.Weight1)}," +
+                            $"{Cell(b.Joint2)},{F(b.Weight2)}");
+        }
+
+        return text.ToString();
+    }
+
+    /// <summary>An unused joint slot is left blank rather than written as -1.</summary>
+    private static string Cell(int joint) => joint < 0 ? "" : joint.ToString(CultureInfo.InvariantCulture);
 
     /// <summary>Six decimals is well past what a 16-bit fixed-point source can carry.</summary>
     private static string F(float value) =>

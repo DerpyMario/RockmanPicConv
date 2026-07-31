@@ -15,10 +15,10 @@ public class ScnMeshTests
             [(0, 0, 0), (1, 0, 0), (0, 0, 1), (1, 0, 1)],
             [(0, 0), (1, 0), (0, 1), (1, 1)]));
 
-        ScnMesh mesh = Assert.IsType<ScnMesh>(ScnMesh.Decode(stream, declaredVertices: 4, declaredTriangles: 2));
+        ScnMesh mesh = Assert.IsType<ScnMesh>(ScnMesh.DecodeDisplayList(stream, declaredVertices: 4, declaredTriangles: 2));
 
-        Assert.Equal("s16 texcoord", mesh.FormatName);
-        Assert.Equal(13, mesh.Format.VertexSize);
+        Assert.Contains("s16 texcoord", mesh.Description);
+        Assert.Equal(13, mesh.Format!.VertexSize);
         Assert.Equal(4, mesh.Vertices.Count);
         Assert.Equal(2, mesh.Triangles.Count);
 
@@ -34,10 +34,10 @@ public class ScnMeshTests
             [(37, 14, -48), (35, 14, -48), (37, 14, -32), (35, 14, -32)],
             [(1f, 0f), (0f, 0f), (1f, 1f), (0f, 1f)]));
 
-        ScnMesh mesh = Assert.IsType<ScnMesh>(ScnMesh.Decode(stream, declaredVertices: 4, declaredTriangles: 2));
+        ScnMesh mesh = Assert.IsType<ScnMesh>(ScnMesh.DecodeDisplayList(stream, declaredVertices: 4, declaredTriangles: 2));
 
-        Assert.Equal("f32 texcoord", mesh.FormatName);
-        Assert.Equal(17, mesh.Format.VertexSize);
+        Assert.Contains("f32 texcoord", mesh.Description);
+        Assert.Equal(17, mesh.Format!.VertexSize);
         Assert.Equal(new ScnVertex(37, 14, -48, 0, 1, 0, 1, 0), mesh.Vertices[0]);
         Assert.Equal(new ScnVertex(35, 14, -32, 0, 1, 0, 0, 1), mesh.Vertices[3]);
     }
@@ -49,8 +49,8 @@ public class ScnMeshTests
             [(0, 0, 0), (1, 0, 0), (0, 0, 1), (1, 0, 1)],
             [(0, 0), (1, 0), (0, 1), (1, 1)]));
 
-        Assert.Null(ScnMesh.Decode(stream, declaredVertices: 6, declaredTriangles: 2));
-        Assert.Null(ScnMesh.Decode(stream, declaredVertices: 4, declaredTriangles: 4));
+        Assert.Null(ScnMesh.DecodeDisplayList(stream, declaredVertices: 6, declaredTriangles: 2));
+        Assert.Null(ScnMesh.DecodeDisplayList(stream, declaredVertices: 4, declaredTriangles: 4));
     }
 
     [Fact]
@@ -64,15 +64,15 @@ public class ScnMeshTests
             [(0.25f, 0.5f), (0.25f, 0.5f), (0.25f, 0.5f), (0.25f, 0.5f)]);
 
         byte[] padTo96 = Stream(vertices, listBytes: 96);
-        ScnMesh wide = Assert.IsType<ScnMesh>(ScnMesh.Decode(padTo96, 4, 2));
-        Assert.Equal(17, wide.Format.VertexSize);
+        ScnMesh wide = Assert.IsType<ScnMesh>(ScnMesh.DecodeDisplayList(padTo96, 4, 2));
+        Assert.Equal(17, wide.Format!.VertexSize);
 
         // The same bytes in a list the record says is 64 long can only be the shorter layout.
         byte[] shorter = Stream(FixedVertices(
             [(1, 2, 3), (4, 5, 6), (7, 8, 9), (10, 11, 12)],
             [(0.25f, 0.5f), (0.25f, 0.5f), (0.25f, 0.5f), (0.25f, 0.5f)]), listBytes: 64);
-        ScnMesh narrow = Assert.IsType<ScnMesh>(ScnMesh.Decode(shorter, 4, 2));
-        Assert.Equal(13, narrow.Format.VertexSize);
+        ScnMesh narrow = Assert.IsType<ScnMesh>(ScnMesh.DecodeDisplayList(shorter, 4, 2));
+        Assert.Equal(13, narrow.Format!.VertexSize);
     }
 
     [Fact]
@@ -82,7 +82,7 @@ public class ScnMeshTests
         byte[] second = FixedVertices([(5, 0, 0), (6, 0, 0), (5, 0, 1)], [(0, 0), (1, 0), (0, 1)]);
         byte[] stream = Stream([.. Primitive(first, 3), .. Primitive(second, 3)], listBytes: 96, wrapped: true);
 
-        ScnMesh mesh = Assert.IsType<ScnMesh>(ScnMesh.Decode(stream, declaredVertices: 6, declaredTriangles: 2));
+        ScnMesh mesh = Assert.IsType<ScnMesh>(ScnMesh.DecodeDisplayList(stream, declaredVertices: 6, declaredTriangles: 2));
 
         Assert.Equal(6, mesh.Vertices.Count);
         Assert.Equal([(0, 1, 2), (3, 4, 5)], mesh.Triangles);
@@ -160,7 +160,8 @@ public class ObjWriterTests : IDisposable
         var mesh = new ScnMesh
         {
             Format = ScnVertexFormats.FixedTexCoord,
-            FormatName = "s16 texcoord",
+            Description = "GX display list, s16 texcoord, 13 B/vertex",
+            PrimitiveCount = 1,
             Vertices =
             [
                 new ScnVertex(1, 2, 3, 0, 1, 0, 0.25f, 0.75f),
@@ -188,7 +189,8 @@ public class ObjWriterTests : IDisposable
         var mesh = new ScnMesh
         {
             Format = ScnVertexFormats.FixedTexCoord,
-            FormatName = "s16 texcoord",
+            Description = "GX display list, s16 texcoord, 13 B/vertex",
+            PrimitiveCount = 1,
             Vertices = [new ScnVertex(0, 0, 0, 0, 1, 0, 0, 0), new ScnVertex(1, 0, 0, 0, 1, 0, 0, 0), new ScnVertex(0, 1, 0, 0, 1, 0, 0, 0)],
             Triangles = [(0, 1, 2)],
             DisplayList = GxDisplayList.Parse(GxDisplayListTests.Strip(0, 13, 3), _ => 13)!,
