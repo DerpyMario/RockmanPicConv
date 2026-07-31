@@ -59,6 +59,9 @@ public sealed class SceneTable
     public IEnumerable<SceneRecord> Entries =>
         Records.Where(r => r.Kind is SceneRecordKind.Entry or SceneRecordKind.Shape or SceneRecordKind.SkinnedShape);
 
+    /// <summary>Joint rest poses, in stored order.</summary>
+    public IEnumerable<ScnNode> Nodes => Records.Where(r => r.Node is not null).Select(r => r.Node!);
+
     /// <summary>Shape entries of either encoding, in stored order.</summary>
     public IEnumerable<SceneRecord> Shapes =>
         Records.Where(r => r.Kind is SceneRecordKind.Shape or SceneRecordKind.SkinnedShape);
@@ -85,6 +88,25 @@ public sealed class SceneTable
                     Raw = record.ToArray(),
                 });
                 at += RecordSize;
+                continue;
+            }
+
+            // A joint's rest pose. These are 104 bytes and, unlike everything else in the table,
+            // are not aligned to 32, so they have to be recognised before the walk steps past one.
+            if (ScnNode.LooksLikeNode(data, at))
+            {
+                FlushPayload(data, records, ref payloadStart, at);
+                ScnNode node = ScnNode.Parse(data, at);
+                records.Add(new SceneRecord
+                {
+                    Offset = at,
+                    Kind = SceneRecordKind.Node,
+                    Name = node.Name,
+                    Field00 = BinaryPrimitives.ReadUInt32BigEndian(record),
+                    Node = node,
+                    Raw = data.Slice(at, ScnNode.RecordSize).ToArray(),
+                });
+                at += ScnNode.RecordSize;
                 continue;
             }
 
@@ -265,6 +287,14 @@ public sealed class SceneTable
                     break;
                 }
 
+                case SceneRecordKind.Node:
+                {
+                    ScnNode node = record.Node!;
+                    text.AppendLine($"  0x{record.Offset:X6}  joint     '{node.Name}'  id={node.Id}  " +
+                                    $"rest=({node.Translation.X:0.###}, {node.Translation.Y:0.###}, {node.Translation.Z:0.###})");
+                    break;
+                }
+
                 case SceneRecordKind.Payload:
                     text.AppendLine($"  0x{record.Offset:X6}  data      {record.Raw.Length:N0} bytes, " +
                                     $"starts {Ascii.Hex(record.Raw.AsSpan(0, Math.Min(8, record.Raw.Length)))}");
@@ -290,6 +320,9 @@ public enum SceneRecordKind
 
     /// <summary>A character model's shape, followed by skinned triangle strips rather than a display list.</summary>
     SkinnedShape,
+
+    /// <summary>A joint's rest pose and inverse bind matrix.</summary>
+    Node,
 
     /// <summary>Records that matched neither shape, kept verbatim.</summary>
     Payload,
@@ -339,6 +372,9 @@ public sealed class SceneRecord
 
     /// <summary>Decoded geometry, set by the caller. Null when it could not be decoded.</summary>
     public ScnMesh? Mesh { get; set; }
+
+    /// <summary>The joint rest pose, on a <see cref="SceneRecordKind.Node"/> record.</summary>
+    public ScnNode? Node { get; init; }
 
     /// <summary>A file-name-safe form of <see cref="Name"/> plus <see cref="Tag"/>.</summary>
     public string FileStem => Tag.Length > 0 ? $"{Name}.{Tag}" : Name;

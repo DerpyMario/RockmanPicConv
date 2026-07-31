@@ -23,19 +23,24 @@ public class MpcModelTests
 
         Assert.Empty(parsed.Warnings);
         Assert.Equal("chn22", parsed.RootName);
-        Assert.Equal(5, parsed.Nodes.Count);
         Assert.Equal(64, parsed.MeshData.Length);
         Assert.Equal(5 * MpcModel.EntrySize, parsed.SkeletonData.Length);
 
-        Assert.Equal([0, 1, 1, 2, 3], parsed.Nodes.Select(n => n.Depth));
+        // The header's entry-shaped record is joint 0, so the table's five entries make six nodes
+        // and every one of their depths sits one below it.
+        Assert.Equal(6, parsed.Nodes.Count);
+        Assert.Equal("chn22", parsed.Nodes[0].Name);
+        Assert.Equal(MpcNodeType.RootChain, parsed.Nodes[0].Type);
+
+        Assert.Equal([0, 1, 2, 2, 3, 4], parsed.Nodes.Select(n => n.Depth));
         Assert.Equal(
-            [MpcNodeCategory.Bone, MpcNodeCategory.Effect, MpcNodeCategory.Chain,
-             MpcNodeCategory.Part, MpcNodeCategory.Effect],
+            [MpcNodeCategory.Chain, MpcNodeCategory.Bone, MpcNodeCategory.Effect,
+             MpcNodeCategory.Chain, MpcNodeCategory.Part, MpcNodeCategory.Effect],
             parsed.Nodes.Select(n => n.Category));
 
-        Assert.Equal("a01bon00", parsed.Nodes[0].Name);
-        Assert.Equal(0x1890, parsed.Nodes[0].GeometryWord);
-        Assert.Equal(0x62, parsed.Nodes[4].Parameter);
+        Assert.Equal("a01bon00", parsed.Nodes[1].Name);
+        Assert.Equal(0x1890, parsed.Nodes[1].GeometryWord);
+        Assert.Equal(0x62, parsed.Nodes[5].Parameter);
     }
 
     [Fact]
@@ -57,7 +62,8 @@ public class MpcModelTests
 
         MpcModel parsed = MpcModel.Parse(model, "test.mpc");
 
-        Assert.Single(parsed.Nodes);
+        // What is left is the header's record and the one entry the file actually holds.
+        Assert.Equal(2, parsed.Nodes.Count);
         Assert.Contains(parsed.Warnings, w => w.Contains("truncating"));
     }
 
@@ -72,8 +78,9 @@ public class MpcModelTests
     private static byte[] Build(string root, IReadOnlyList<(int Type, string Name, int Geometry, int Parameter)> nodes,
                                 int meshBytes)
     {
+        // The stored count takes in the header's record as well as the table.
         var writer = new BigEndianWriter()
-            .U32(nodes.Count)
+            .U32(nodes.Count + 1)
             .U32(0xFD00)
             .Zeros(3).Field(root, 8).Zeros(2)           // the root chain, in an entry-shaped record
             .PadTo(MpcModel.EntryTableOffset);

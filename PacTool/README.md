@@ -38,7 +38,7 @@ Verified invariants across all 203 archives:
 
 ```
 dotnet build -c Release          # produces bin/Release/net8.0/pactool
-dotnet test                      # 162 tests, from the solution root
+dotnet test                      # 195 tests, from the solution root
 ```
 
 Targets .NET 8. The tool itself has **no external dependencies** — the GX texture decoders and the
@@ -53,6 +53,7 @@ pactool unpack <archive.pac> [-o <dir>] [--decode] [--no-manifest] [--strict]
 pactool pack   <input> <archive.pac> [--align <n>] [--no-align]
 pactool verify <archive.pac> [<archive.pac> ...] [--strict]
 pactool decode <file> [<file> ...] [-o <dir>] [--mips] [--raw] [--flat]
+                                   [--no-j3d] [--bdl] [--motion-csv]
 pactool info   <file> [<file> ...]
 ```
 
@@ -105,17 +106,20 @@ Stage0b.pac: CAPR archive, 22 member(s)
   l0blight.pcp         Picture Pack, 12 texture(s)
   d2dxxxxx.scn         Picture Pack, 2 texture(s) + 14,048 B scene table
     2 shape(s), 2 decoded to geometry (2 skinned), 464 triangle(s)
-  d2dxxxxx.mpc         MPC model, 6 node(s), root 'chn5', 3,536 B mesh data
+  d2dxxxxx.mpc         MPC skeleton, 6 joint(s), root 'chn5', 1 motion(s)
+  d2dxxxxx (rigged)    6 joint(s), 1 posed, 2 mesh(es), 1 motion(s)
   ...
-Wrote 242 file(s) to .../out
+Wrote 300 file(s) to .../out
   51 image(s) and 104 mesh(es) decoded, 0 item(s) copied verbatim
+  8 J3D model(s) and 34 animation(s) written
 ```
 
 | Input | Output |
 | --- | --- |
-| `.pac` | each member, decoded into its own directory |
+| `.pac` | each member, decoded into its own directory, plus a `<stem>.model/` for every scene and skeleton that pair up |
 | `.pcp` / `.scn` | `textures/*.png` and `textures/textures.txt`; for `.scn`, `scene.txt`, `scene.bin`, `geometry/*.obj` (plus `.skin.csv` for character models) and one combined `<name>.obj` |
-| `.mpc` | `skeleton.txt`, `skeleton.bin`, `mesh.bin` |
+| `.mpc` | `skeleton.txt`, `skeleton.bin`, `motions.txt` and `animation/*.bck` |
+| `<stem>.model/` | `skeleton.txt`, `<stem>.bmd`, `motions.txt` and `animation/*.bck` — the assembled character |
 | `map.dat` / `bg.dat` / `enemy.dat` | `directory.txt` and `leveldata.bin` |
 | `.bmd` / `.bdl` | `model.txt`, `sections/*.bin`, `textures/*.png` |
 | `.bti` | `<name>.png` |
@@ -123,8 +127,10 @@ Wrote 242 file(s) to .../out
 | anything else | copied out verbatim |
 
 `--mips` writes every mip level (`tex.png`, `tex.mip1.png`, …) rather than only the base one;
-`--raw` keeps the stored bytes too — each texture's, and each display list's. Yaz0-compressed
-input is decompressed before it is identified. `unpack --decode` does both jobs at once, putting the converted files in
+`--raw` keeps the stored bytes too — each texture's, and each display list's. `--no-j3d` skips the
+`.bmd` and `.bck` export, `--bdl` writes the `bdl4` variant instead of `bmd3`, and `--motion-csv`
+writes each animation's frames out as a table beside it. Yaz0-compressed input is decompressed
+before it is identified. `unpack --decode` does both jobs at once, putting the converted files in
 `<dir>/decoded/` so that packing the unpack directory back up is unaffected.
 
 `info` prints the same analysis without writing anything:
@@ -186,9 +192,10 @@ texture header:
 
 The scene table of a `.scn` is a run of 32-byte records, classified by shape rather than by name:
 a **section header** (a count followed by thirty zero bytes), a **named entry** (a name at 0x04,
-plus an RGBA colour at 0x14 on material entries), or a **shape** — a named entry followed by
-geometry. There are two encodings of geometry, and the word at 0x00 says which: 0 for a GX display
-list, 1 for the skinned strips a character model uses. Their fields sit in different places.
+plus an RGBA colour at 0x14 on material entries), a **joint** (a rest pose, see below), or a
+**shape** — a named entry followed by geometry. There are two encodings of geometry, and the word
+at 0x00 says which: 0 for a GX display list, 1 for the skinned strips a character model uses. Their
+fields sit in different places.
 
 ```
 display list                      skinned strips
@@ -274,25 +281,91 @@ always zero. `m01xxxxx.scn` decodes to a figure 63 units tall, symmetric about x
 y ≈ 0, bound to joints 22–36 of a 37-joint skeleton.
 
 That joint reference is the load-bearing cross-check: the indices address the `.mpc` of the same
-stem, and 97% of them fall inside its node count. The exceptions are four shapes in `c16xxxxx.scn`
-and six whose `.mpc` is not in this data set, so the mapping is reported rather than asserted.
+stem, and once its header record is counted as joint 0 (see below), **every index in the reference
+data falls inside its joint table** — which is what fixed the numbering in the first place, since
+before that the highest index in a dozen models was exactly one past the end.
 
 Geometry is exported as Wavefront OBJ — one file per shape under `geometry/`, plus one combined
 file per container. Vertices are written exactly as stored, with no welding, so the file stays a
 record of the source rather than an interpretation of it. OBJ has nowhere to put skin weights, so a
 skinned shape also gets a `.skin.csv` beside it listing each vertex's joints and weights.
 
-**The `.mpc` mesh blob is still not decoded.** It is not a display list — no run of GX primitive
-opcodes appears at any node's geometry offset across all 119 sampled files — and it is not skinned
-strips either. Given the skeleton it sits behind and the `MotionTest` directory it ships in,
-animation is the obvious guess, but it is a guess; the blob is extracted verbatim.
+### Joint rest poses
 
-### MPC models (`.mpc`)
+A character's `.scn` also carries a rest pose per joint, as 104-byte records in the scene table —
+the only records in it that are **not** aligned to 32. A record is the usual 32-byte header, with a
+name at 0x04 and a non-zero value in the high half of the word at 0x00, followed by 72 bytes:
 
-A skeleton followed by packed mesh data. Entries are 24 bytes and appear in depth-first order; the
-type byte both names the node's role — root bone, chain connector, mesh part, effect node — and
-fixes its depth, so the tree is recoverable from the flat sequence. Mesh parts carry an offset into
-the mesh blob in 16-bit words. The header at 0x08 is an entry-shaped record naming the root chain.
+```
+0x00  f32[3]   translation   relative to the parent joint
+0x0C  f32[3]   scale
+0x18  f32[12]  inverse bind  3x4, row-major: rotation rows each followed by their offset
+```
+
+Across the **4801 records** in the reference data every scale is (1, 1, 1) — nine of them off by a
+part in a million, the rest exact — and every inverse bind matrix has orthonormal rows with
+determinant 1. They are rotations with no reflection or shear, which is what lets the rotation be
+recovered as a quaternion without qualification. Because guessing wrong here would desynchronise
+the whole table walk, a record is only accepted when the name, the leading word, the scale and all
+three matrix rows agree.
+
+### MPC skeletons and motions (`.mpc`)
+
+A joint table followed by the animations that drive it. Entries are 24 bytes and appear in
+depth-first order; the type byte both names the joint's role — root bone, chain connector, mesh
+part, effect node — and fixes its depth, so the tree is recoverable from the flat sequence.
+
+**The header's record at 0x08 is joint 0, not a separate header field.** It has the same 24-byte
+shape as a table entry, and the stored count takes it in, so the table itself holds one fewer.
+That numbering is what makes the skin weights line up: the `.scn`'s joint indices reach one past
+the table, and the name in that header record turns up among the `.scn`'s rest poses in **all 178**
+models that have both halves. Everything in the table therefore sits one level below it.
+
+What follows the table is not mesh data. It is a **motion directory** — 16-byte records of an
+offset, an eight-character name and a reserved word — running until the offset of the first motion,
+which is where the directory ends. Each motion is a 20-byte header and then one uncompressed frame
+after another; there are no keyframes and nothing to interpolate.
+
+```
+motion header                     frame
+0x00  u16      frameCount         0x00  ...  model track[2 or 3]
+0x02  u16      tracks             ...   s16  reserved, zero throughout
+0x04  char[8]  name               ...        joint track[joints][1, 2 or 3]
+0x0C  u8[8]    reserved
+0x14  ...      frame[frameCount]
+```
+
+A track is three signed 16-bit values. Rotations are angles where 32768 is a half turn, the
+convention this hardware uses throughout; translations are fixed point with an 8-bit fraction,
+matching the geometry. The low nibble of `tracks` says how many of each are present: bit 1 is
+always set and gives one joint track and two model tracks, bit 2 adds one of each, bit 3 adds
+another joint track, and bit 0 another model track. **Every combination that occurs reproduces the
+exact distance to the next motion in the file, for 1220 of the 1239 motions** in the reference
+data; the other 19 state more frames than the space before the next motion can hold, and are
+reported and skipped.
+
+Which track is which was settled by what the values do rather than by a field:
+
+- **The last track of a run is the rotation.** Where a joint has only one track its values sweep
+  past 32767 and wrap to negative, which only an angle does; and the last track of every model
+  block is a constant (16384, 0, 0), which as an angle is the quarter turn a model's base
+  orientation needs and as anything else is meaningless.
+- **The first track of a longer run is the translation.** A walking animation's first model track
+  advances along one axis frame by frame, and a jump's rises and falls on another.
+- **The middle track of a run of three is not identified.** It is written to the `--motion-csv`
+  listing but not used when building an animation.
+
+### Rigged characters
+
+A character is split across two members and neither half is a model on its own: `m01xxxxx.scn`
+holds the geometry, the textures and the rest poses, `m01xxxxx.mpc` holds the joint table and the
+motions. `decode` joins them by stem and writes the result to `<stem>.model/`.
+
+A joint's parent is the last entry above it in the walk that sits at a shallower depth. Rest poses
+are matched by name, and each record is consumed once in order rather than looked up in a
+dictionary, because a skeleton repeats a name for a mirrored limb. Over the reference data 2893 of
+5608 joints in 178 models find one; the rest are mostly `eff*` effect nodes, and are exported at
+the origin with a warning saying how many.
 
 ### Stage directories (`map.dat`, `bg.dat`, `enemy.dat`)
 
@@ -315,11 +388,43 @@ verbatim; `TEX1` textures are decoded to PNG through the shared GX decoder, `INF
 hierarchy listing, and the names in `JNT1` and `MAT3` are resolved against it.
 
 Several `TEX1` headers may point at one shared image, because each header's image and palette
-offsets are relative to itself — that is handled. **Geometry is not reconstructed**: unlike the `.scn`
-shapes, a BMD's vertex layout is stored in its own `VTX1` and `SHP1` sections rather than having to
-be recovered, but nothing in this repository would exercise the code, so it is not written.
+offsets are relative to itself — that is handled.
 
 A standalone `.bti` is the same texture header at offset 0, and decodes the same way.
+
+### Writing J3D: `.bmd` / `.bdl` and `.bck`
+
+No J3D file ships with this game, so the writers exist to get its models somewhere that can open
+them. `pactool` writes the eight sections a rigged, textured model needs — `INF1`, `VTX1`, `EVP1`,
+`DRW1`, `JNT1`, `SHP1`, `MAT3`, `TEX1`, in that order, because readers rely on `TEX1` being last.
+`--bdl` changes the variant tag to `bdl4`; the `MDL3` section that normally accompanies it is a
+cache of precompiled register writes, and is not written, since a reader rebuilds that state from
+`MAT3` regardless.
+
+Three things have to change on the way out:
+
+- **Vertices are welded.** The source repeats a vertex for every strip that touches it; J3D indexes
+  into shared arrays. The matrix index stays per corner rather than per vertex, because J3D indexes
+  position, normal and texture coordinate separately from the pose.
+- **Skin weights become tables.** Each distinct set of influences is interned into `EVP1` once, and
+  `DRW1` says for each slot whether it names a weight set or a joint directly — so a rigidly bound
+  vertex skips the weighting maths entirely.
+- **Shapes are split into packets.** The transform unit holds ten posing matrices at a time, and a
+  character limb routinely draws with more. Triangles are taken in order and a packet is closed as
+  soon as the next one would not fit, which keeps neighbouring triangles — and the joints they
+  share — together. `m01xxxxx`'s two shapes come out as 55 packets.
+
+`MAT3` stores a material as a 332-byte record of indices into per-field tables, so writing one
+means writing all twenty-odd tables it indexes as well; each gets a single entry that every
+material shares, giving one flat-lit, texture-modulated material per shape. Tables that nothing
+indexes are left out and their indices set to 0xFFFF, which is how J3D spells "none".
+
+An animation becomes `J3D1 bck1` with a single `ANK1` section. Each joint is three components, and
+each component three index records — scale, rotation, translation — into shared pools. The source
+stores every frame in full, so this writes one key per frame with a zero tangent, which a reader
+interpolates linearly through; a component that never changes collapses to one constant key, which
+is most of them. Skeleton joint 0 takes the whole-model track, since the motions animate the table
+joints only.
 
 ### Softimage PIC (`.pic`)
 
@@ -365,15 +470,21 @@ a `PIC\0` magic and 16-byte descriptors that no shipped `.pcp` has.
 - Texture decoding against `mmnt_pac_extract_full.py`'s own PNGs — **141/141**, differing only in
   the tile the reference truncates.
 - Mip-chain sizing against every texture header in the reference data — **3048/3048**.
-- `decode` over every `.pac`, `.pcp`, `.scn`, `.mpc` and `.pic` in `files.7z` — 3147 images and
-  7898 meshes written, 12 items copied verbatim (the `playdemo*.dat` input recordings, whose format
-  is not known), no crashes and 4 warnings, all of them the undecodable shapes named above.
-- Geometry decoding — **7898/7902** shapes, 641,480 triangles. Spot checks hold up
+- `decode` over every `.pac`, `.pcp`, `.scn`, `.mpc` and `.pic` in `files.7z` — 17,893 files
+  written, 3147 images and 8536 meshes, 12 items copied verbatim (the `playdemo*.dat` input
+  recordings, whose format is not known), no crashes and 197 notes: 178 saying how many joints of a
+  model have no rest pose, and 19 motions that do not fit before the next one.
+- Geometry decoding — **8536/8536** shapes, 641,480 triangles. Spot checks hold up
   geometrically: `roomconv.scn`'s `cube1M0` has 24 vertices at exactly 8 distinct corners, and its
   `scballM0` is a sphere whose radius from the bounding-box centre varies only between 3.398 and
   3.404. Across a 600-file sample of the exported OBJs, **no normal** is off unit length.
-- 152 unit tests. The J3D and Yaz0 fixtures are constructed rather than sampled, since the
-  reference data contains neither.
+- J3D export — 178 `.bmd` and 1855 `.bck` written from the reference data, every one of them read
+  back through an independent Python validator written against blemd's read order: section chain,
+  string tables, every array bound, every index in range, packet matrix counts within the hardware
+  limit, and a single-rooted scene graph. **178/178** and **1855/1855** pass.
+- 195 unit tests. The J3D and Yaz0 fixtures are constructed rather than sampled, since the
+  reference data contains neither; the BMD writer is checked by reading its output back through
+  this repository's own J3D reader, and the BCK writer through a separate reader in the tests.
 
 ## Notes and edge cases
 
@@ -420,12 +531,20 @@ src/Formats/ContentSniffer.cs   works out what a payload is
 src/Formats/PicturePack.cs      .pcp / .scn texture container
 src/Formats/SceneTable.cs       the scene description a .scn appends
 src/Formats/ScnMesh.cs          shape geometry: display lists and skinned strips
-src/Formats/MpcModel.cs         .mpc skeleton and mesh data
+src/Formats/ScnNode.cs          joint rest poses and inverse bind matrices
+src/Formats/MpcModel.cs         .mpc joint table
+src/Formats/MpcMotion.cs        the motion directory and its uncompressed frames
+src/Formats/RiggedModel.cs      joins a .scn and a .mpc into one posable character
 src/Formats/DataDirectory.cs    map.dat / bg.dat / enemy.dat
 src/Formats/J3dModel.cs         .bmd / .bdl
 src/Formats/BtiTexture.cs       BTI texture header, standalone and inside TEX1
 src/Formats/SoftimagePic.cs     .pic source art
 src/Formats/Yaz0.cs             Nintendo's run-length compression
+
+src/Export/J3dWriter.cs         big-endian output with the offset patching J3D needs
+src/Export/BmdGeometry.cs       welding, weight tables and packet splitting
+src/Export/BmdWriter.cs         .bmd / .bdl output
+src/Export/BckWriter.cs         .bck skeletal animation output
 
 src/Extract/ContentExtractor.cs orchestration: what gets written where
 src/Extract/ObjWriter.cs        Wavefront OBJ output
@@ -443,6 +562,10 @@ and the per-attribute size rules — were taken from these and then checked agai
 - [MeltyTool / FinModelUtility](https://github.com/MeltyPlayer/MeltyTool) — a second implementation
   of GameCube model and display list reading, useful as a cross-check on the GX conventions. It
   does not cover this game.
+- [blemd](https://github.com/niacdoial/blemd) — a Blender importer for J3D. Its readers are the
+  reference for what the writers here produce: `Shp1.py` for the batch, packet, matrix data and
+  packet location records, `Mat3.py` for the 332-byte material record and the tables it indexes,
+  `Bck.py` for the `ANK1` layout, and `Inf1.py` for the scene graph's single-root requirement.
 - [Dolphin](https://github.com/dolphin-emu/dolphin) — `VideoCommon/CPMemory.h` for the exact
   bitfield positions, `VideoCommon/OpcodeDecoding.h` for the opcodes, and the `VertexLoader_*.h`
   size tables for what each attribute costs in each mode. Dolphin is the reason two apparent
