@@ -67,7 +67,7 @@ public static class BckWriter
             joints.Add(indices);
         }
 
-        var section = new J3dWriter();
+        var section = new BigEndianOutput();
         section.Ascii("ANK1").U32(0);
         section.U8(loopMode).U8(AngleShift);
         section.U16(Math.Max(0, motion.FrameCount - 1));
@@ -103,7 +103,7 @@ public static class BckWriter
         section.PatchU32(4, section.Length);
 
         byte[] body = section.ToArray();
-        var file = new J3dWriter();
+        var file = new BigEndianOutput();
         file.Ascii("J3D1").Ascii("bck1").U32(0).U32(1);
         file.Ascii("SVR1").Fill(12, 0xFF);
         file.Bytes(body);

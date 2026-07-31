@@ -188,8 +188,43 @@ public class ContentExtractorTests : IDisposable
         Assert.Equal((byte)'#', listing[0]);
     }
 
-    private static ExtractOptions Options(bool allMips = false, bool keepRaw = false) =>
-        new() { AllMips = allMips, KeepRaw = keepRaw };
+    [Fact]
+    public void ATextureBankIsOnlyWrittenWhenAskedFor()
+    {
+        byte[] pack = PicturePackTests.Build([
+            PicturePackTests.Texture("tex0", GxTextureFormat.Cmpr, 8, 8, maxLod: 0),
+            PicturePackTests.Texture("tex1", GxTextureFormat.Rgb5A3, 4, 4, maxLod: 0),
+        ]);
+        string tpl = Path.Combine(_directory, "textures", "stage.tpl");
+
+        ContentExtractor.Extract("stage.pcp", pack, _directory, Options());
+        Assert.False(File.Exists(tpl));
+
+        ExtractResult result = ContentExtractor.Extract("stage.pcp", pack, _directory, Options(tpl: true));
+
+        Assert.Equal(1, result.TexturePacksWritten);
+        Assert.True(File.Exists(tpl));
+        Assert.True(File.Exists(tpl + ".txt"));
+
+        // Both textures are in the one bank, which is what a TPL is for.
+        Assert.Equal(2u, System.Buffers.Binary.BinaryPrimitives.ReadUInt32BigEndian(
+            File.ReadAllBytes(tpl).AsSpan(4)));
+    }
+
+    [Fact]
+    public void SourceArtBecomesATextureBankToo()
+    {
+        // A PIC never was a GX texture, so this is the path that has to encode rather than copy.
+        byte[] pic = SoftimagePicTests.Solid(4, 4);
+
+        ExtractResult result = ContentExtractor.Extract("art.pic", pic, _directory, Options(tpl: true));
+
+        Assert.Equal(1, result.TexturePacksWritten);
+        Assert.True(File.Exists(Path.Combine(_directory, "art.tpl")));
+    }
+
+    private static ExtractOptions Options(bool allMips = false, bool keepRaw = false, bool tpl = false) =>
+        new() { AllMips = allMips, KeepRaw = keepRaw, ExportTpl = tpl };
 
     private static byte[] MapDat() => new BigEndianWriter()
         .U32(DataDirectory.HeaderSize + 4 + 20)         // table size, measured from the block start

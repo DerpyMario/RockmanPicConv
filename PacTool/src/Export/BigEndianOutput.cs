@@ -4,25 +4,26 @@ using System.Text;
 namespace PacTool.Export;
 
 /// <summary>
-/// Big-endian output with the offset patching every J3D section needs: sizes and internal pointers
-/// are only known once the thing they describe has been written.
+/// Big-endian output with the offset patching these GameCube formats need: sizes and internal
+/// pointers are only known once the thing they describe has been written, so they are reserved,
+/// filled in afterwards, and never computed twice. Used by the J3D and TPL writers alike.
 /// </summary>
-public sealed class J3dWriter
+public sealed class BigEndianOutput
 {
     private readonly MemoryStream _stream = new();
 
     /// <summary>Bytes written so far.</summary>
     public int Length => (int)_stream.Length;
 
-    public J3dWriter U8(int value)
+    public BigEndianOutput U8(int value)
     {
         _stream.WriteByte((byte)value);
         return this;
     }
 
-    public J3dWriter S8(int value) => U8(value & 0xFF);
+    public BigEndianOutput S8(int value) => U8(value & 0xFF);
 
-    public J3dWriter U16(int value)
+    public BigEndianOutput U16(int value)
     {
         Span<byte> buffer = stackalloc byte[2];
         BinaryPrimitives.WriteUInt16BigEndian(buffer, (ushort)value);
@@ -30,9 +31,9 @@ public sealed class J3dWriter
         return this;
     }
 
-    public J3dWriter S16(int value) => U16(value & 0xFFFF);
+    public BigEndianOutput S16(int value) => U16(value & 0xFFFF);
 
-    public J3dWriter U32(long value)
+    public BigEndianOutput U32(long value)
     {
         Span<byte> buffer = stackalloc byte[4];
         BinaryPrimitives.WriteUInt32BigEndian(buffer, (uint)value);
@@ -40,7 +41,7 @@ public sealed class J3dWriter
         return this;
     }
 
-    public J3dWriter F32(float value)
+    public BigEndianOutput F32(float value)
     {
         Span<byte> buffer = stackalloc byte[4];
         BinaryPrimitives.WriteSingleBigEndian(buffer, value);
@@ -49,17 +50,17 @@ public sealed class J3dWriter
     }
 
     /// <summary>Writes raw bytes.</summary>
-    public J3dWriter Bytes(ReadOnlySpan<byte> data)
+    public BigEndianOutput Bytes(ReadOnlySpan<byte> data)
     {
         _stream.Write(data);
         return this;
     }
 
     /// <summary>Writes ASCII with no padding or terminator.</summary>
-    public J3dWriter Ascii(string text) => Bytes(Encoding.ASCII.GetBytes(text));
+    public BigEndianOutput Ascii(string text) => Bytes(Encoding.ASCII.GetBytes(text));
 
     /// <summary>Writes <paramref name="count"/> bytes of <paramref name="value"/>.</summary>
-    public J3dWriter Fill(int count, byte value = 0)
+    public BigEndianOutput Fill(int count, byte value = 0)
     {
         for (int i = 0; i < count; i++)
             _stream.WriteByte(value);
@@ -69,29 +70,37 @@ public sealed class J3dWriter
 
     /// <summary>
     /// Pads up to a multiple of <paramref name="alignment"/>. J3D pads with the ASCII of
-    /// "This is padding data to alignment", which readers rely on only for its length.
+    /// "This is padding data to alignment", which readers rely on only for its length; pass
+    /// <paramref name="fill"/> for formats that pad with a plain byte, as TPL does with zero.
     /// </summary>
-    public J3dWriter Align(int alignment = 32)
+    public BigEndianOutput Align(int alignment = 32, byte? fill = null)
     {
         const string Filler = "This is padding data to alignment.....";
         int target = (Length + alignment - 1) / alignment * alignment;
         for (int i = 0; Length < target; i++)
-            _stream.WriteByte((byte)Filler[i % Filler.Length]);
+            _stream.WriteByte(fill ?? (byte)Filler[i % Filler.Length]);
 
         return this;
     }
 
     /// <summary>Overwrites a 32-bit value written earlier, for section sizes and internal offsets.</summary>
-    public J3dWriter PatchU32(int at, long value)
+    public BigEndianOutput PatchU32(int at, long value)
     {
         BinaryPrimitives.WriteUInt32BigEndian(_stream.GetBuffer().AsSpan(at, 4), (uint)value);
         return this;
     }
 
     /// <summary>Overwrites a 16-bit value written earlier.</summary>
-    public J3dWriter PatchU16(int at, int value)
+    public BigEndianOutput PatchU16(int at, int value)
     {
         BinaryPrimitives.WriteUInt16BigEndian(_stream.GetBuffer().AsSpan(at, 2), (ushort)value);
+        return this;
+    }
+
+    /// <summary>Overwrites a 32-bit float written earlier.</summary>
+    public BigEndianOutput PatchF32(int at, float value)
+    {
+        BinaryPrimitives.WriteSingleBigEndian(_stream.GetBuffer().AsSpan(at, 4), value);
         return this;
     }
 
@@ -102,7 +111,7 @@ public sealed class J3dWriter
     /// Writes a J3D string table: a count, then a hash and a relative offset per string, then the
     /// strings themselves.
     /// </summary>
-    public J3dWriter StringTable(IReadOnlyList<string> names)
+    public BigEndianOutput StringTable(IReadOnlyList<string> names)
     {
         int start = Length;
         U16(names.Count).U16(0xFFFF);

@@ -23,6 +23,9 @@ public sealed class ExtractOptions
     /// <summary>Also write each motion's frames as CSV.</summary>
     public bool MotionTables { get; set; }
 
+    /// <summary>Also write each container's textures as a .tpl texture bank.</summary>
+    public bool ExportTpl { get; set; }
+
     /// <summary>Receives one line per decoded item.</summary>
     public Action<string> Log { get; set; } = _ => { };
 }
@@ -45,6 +48,9 @@ public sealed class ExtractResult
     /// <summary>Animations written as BCK.</summary>
     public int AnimationsWritten { get; set; }
 
+    /// <summary>Texture banks written as TPL.</summary>
+    public int TexturePacksWritten { get; set; }
+
     /// <summary>Items whose format was not recognised and were copied verbatim.</summary>
     public int Unrecognised { get; set; }
 
@@ -59,6 +65,7 @@ public sealed class ExtractResult
         MeshesWritten += other.MeshesWritten;
         ModelsWritten += other.ModelsWritten;
         AnimationsWritten += other.AnimationsWritten;
+        TexturePacksWritten += other.TexturePacksWritten;
         Unrecognised += other.Unrecognised;
         Warnings.AddRange(other.Warnings);
     }
@@ -282,7 +289,11 @@ public static class ContentExtractor
         }
 
         if (pack.Textures.Count > 0)
+        {
             WriteText(Path.Combine(textureDirectory, "textures.txt"), index.ToString(), result);
+            WriteTpl(textureDirectory, Path.GetFileNameWithoutExtension(name), name,
+                     pack.Textures.Select(TplTexture.From).ToList(), options, result);
+        }
 
         if (pack.Scene is { } scene)
             ExtractScene(name, scene, outputDirectory, options, result);
@@ -454,6 +465,10 @@ public static class ContentExtractor
             WriteMips(textureDirectory, stem, texture.MipCount, options, result,
                       level => texture.Decode(level), name, texture.Name);
         }
+
+        WriteTpl(textureDirectory, Path.GetFileNameWithoutExtension(name), name,
+                 model.Textures.Select((t, i) => TplTexture.From(t, t.Name.Length > 0 ? t.Name : $"texture_{i:D3}")).ToList(),
+                 options, result);
     }
 
     private static void ExtractBti(string name, byte[] data, string outputDirectory,
@@ -464,8 +479,12 @@ public static class ContentExtractor
         options.Log($"  {name,-20} BTI, {texture.Describe()}");
 
         string stem = SafeName(Path.GetFileNameWithoutExtension(name));
-        WriteMips(outputDirectory, stem.Length > 0 ? stem : "texture", texture.MipCount, options, result,
+        if (stem.Length == 0)
+            stem = "texture";
+
+        WriteMips(outputDirectory, stem, texture.MipCount, options, result,
                   level => texture.Decode(level), name, name);
+        WriteTpl(outputDirectory, stem, name, [TplTexture.From(texture, stem)], options, result);
     }
 
     private static void ExtractPic(string name, byte[] data, string outputDirectory,
@@ -476,9 +495,40 @@ public static class ContentExtractor
         options.Log($"  {name,-20} {pic.Describe()}");
 
         string stem = SafeName(Path.GetFileNameWithoutExtension(name));
-        PngWriter.Save(pic.Image, Path.Combine(outputDirectory, (stem.Length > 0 ? stem : "image") + ".png"));
+        if (stem.Length == 0)
+            stem = "image";
+
+        PngWriter.Save(pic.Image, Path.Combine(outputDirectory, stem + ".png"));
         result.FilesWritten++;
         result.ImagesWritten++;
+
+        // Source art never was a GX texture, so this is the one place a TPL is encoded rather than
+        // copied: RGBA8, which keeps every colour and every alpha value the PIC held.
+        WriteTpl(outputDirectory, stem, name, [TplTexture.From(pic.Image, stem)], options, result);
+    }
+
+    /// <summary>
+    /// Writes a container's textures as one TPL, the texture bank the GameCube SDK loads directly.
+    /// A Picture Pack or a <c>TEX1</c> section is already a bank of GX textures, so the mip chains
+    /// go across byte for byte and only the headers around them are new.
+    /// </summary>
+    private static void WriteTpl(string directory, string stem, string sourceName,
+                                 IReadOnlyList<TplTexture> textures, ExtractOptions options, ExtractResult result)
+    {
+        if (!options.ExportTpl || textures.Count == 0)
+            return;
+
+        try
+        {
+            Write(Path.Combine(directory, stem + ".tpl"), TplWriter.Build(textures), result);
+            WriteText(Path.Combine(directory, stem + ".tpl.txt"), TplWriter.Describe(sourceName, textures), result);
+            result.TexturePacksWritten++;
+        }
+        catch (PacFormatException ex)
+        {
+            result.Warnings.Add($"{sourceName}: {ex.Message}");
+            options.Log($"    note: {ex.Message}");
+        }
     }
 
     /// <summary>

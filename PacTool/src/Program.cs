@@ -1,6 +1,7 @@
 using System.Buffers;
 using System.Text;
 using System.Text.Json;
+using PacTool.Cli;
 using PacTool.Extract;
 using PacTool.Formats;
 
@@ -14,11 +15,19 @@ internal static class Program
 
         Usage:
           pactool list   <archive.pac> [--json]
-          pactool unpack <archive.pac> [-o <dir>] [--decode] [--no-manifest] [--strict]
+          pactool unpack <input> [<input> ...] [-o <dir>] [--decode] [--no-manifest] [--strict]
           pactool pack   <input> <archive.pac> [--align <n>] [--no-align]
-          pactool verify <archive.pac> [<archive.pac> ...] [--strict]
-          pactool decode <file> [<file> ...] [-o <dir>] [--mips] [--raw] [--flat]
-          pactool info   <file> [<file> ...]
+          pactool verify <input> [<input> ...] [--strict]
+          pactool decode <input> [<input> ...] [-o <dir>] [--mips] [--raw] [--tpl] [--flat]
+          pactool info   <input> [<input> ...]
+
+        Every <input> may be a file, a directory or a wildcard such as "Stage*.pac". A directory
+        contributes the files inside it that the command handles; add --recurse for its
+        subdirectories too, or --all to take every file in it whatever its name.
+
+        Drag and drop: dropping files or folders onto the executable runs them without a command.
+        Archives are unpacked and converted, everything else is converted, each beside its input,
+        and the window waits for a key at the end so the report can be read.
 
         pack accepts three kinds of <input>:
           pac.json    a manifest written by unpack. Rebuilds byte for byte: member order,
@@ -40,9 +49,12 @@ internal static class Program
 
         Options:
           -o <dir>     output directory (default: ./<input name without extension>)
+          -r, --recurse  expand directories into their subdirectories as well
+          --all        take every file in an expanded directory, not only the known kinds
           --decode     unpack also converts each member's contents, into <dir>/decoded/
           --mips       write every mip level, not only the base one
           --raw        keep the stored bytes too: each texture's, and each display list's
+          --tpl        also write the textures as a .tpl texture bank
           --no-j3d     skip the .bmd and .bck export
           --bdl        write .bdl rather than .bmd
           --motion-csv also write each motion's frames as CSV
@@ -52,6 +64,8 @@ internal static class Program
           --no-manifest  extract payloads only, skip pac.json and the .lst
           --strict     treat structural oddities as errors rather than warnings
           --json       machine-readable output for list
+          --pause      wait for a key before exiting (automatic when dropped onto the executable)
+          --no-pause   never wait, even then
 
         Archive layout: a flat chain of 32-byte big-endian headers, each followed by its
         payload; there is no central directory and the chain ends at end of file.
@@ -61,9 +75,14 @@ internal static class Program
 
     private static int Main(string[] args)
     {
+        // Whether to wait at the end is decided before anything can fail, so a run that ends in an
+        // error still leaves the message on screen rather than closing over it.
+        bool dropped = args.Length > 0 && !IsCommand(args[0]) && !args[0].StartsWith('-');
+        bool pause = dropped && ConsoleSession.OwnsConsole();
+
         try
         {
-            return Run(args);
+            return Run(args, ref pause);
         }
         catch (PacFormatException ex)
         {
@@ -80,9 +99,18 @@ internal static class Program
             Error(ex.Message);
             return 1;
         }
+        finally
+        {
+            if (pause)
+                ConsoleSession.Pause();
+        }
     }
 
-    private static int Run(string[] args)
+    private static bool IsCommand(string arg) => arg is
+        "list" or "unpack" or "extract" or "pack" or "repack" or "verify" or "test" or
+        "decode" or "convert" or "info" or "describe";
+
+    private static int Run(string[] args, ref bool pause)
     {
         if (args.Length == 0 || args[0] is "-h" or "--help" or "help")
         {
@@ -90,10 +118,13 @@ internal static class Program
             return args.Length == 0 ? 2 : 0;
         }
 
+        // A run with no command at all is a drag and drop: the paths are the whole argument list,
+        // and what to do with each is decided from what it turns out to be.
+        bool dropped = !IsCommand(args[0]) && !args[0].StartsWith('-');
         var options = new Options();
         var positional = new List<string>();
 
-        for (int i = 1; i < args.Length; i++)
+        for (int i = dropped ? 0 : 1; i < args.Length; i++)
         {
             string arg = args[i];
             switch (arg)
@@ -141,6 +172,21 @@ internal static class Program
                 case "--motion-csv":
                     options.MotionTables = true;
                     break;
+                case "--tpl":
+                    options.Tpl = true;
+                    break;
+                case "-r" or "--recurse" or "--recursive":
+                    options.Recurse = true;
+                    break;
+                case "--all":
+                    options.All = true;
+                    break;
+                case "--pause":
+                    options.Pause = true;
+                    break;
+                case "--no-pause":
+                    options.Pause = false;
+                    break;
                 default:
                     if (arg.StartsWith('-'))
                         return UsageError($"Unknown option '{arg}'.");
@@ -149,6 +195,12 @@ internal static class Program
             }
         }
 
+        if (options.Pause is { } wanted)
+            pause = wanted;
+
+        if (dropped)
+            return Dropped(positional, options);
+
         return args[0] switch
         {
             "list" => List(positional, options),
@@ -156,9 +208,103 @@ internal static class Program
             "pack" or "repack" => Pack(positional, options),
             "verify" or "test" => Verify(positional, options),
             "decode" or "convert" => Decode(positional, options),
-            "info" or "describe" => Info(positional),
+            "info" or "describe" => Info(positional, options),
             _ => UsageError($"Unknown command '{args[0]}'."),
         };
+    }
+
+    /// <summary>
+    /// Files and folders dropped onto the executable, with no command to say what to do with them.
+    ///
+    /// Each one gets whatever is most useful for what it is: an archive is unpacked and its members
+    /// converted, anything else is converted. Output lands beside the input rather than in the
+    /// working directory, because a process started from a file manager inherits a working
+    /// directory that has nothing to do with where the files came from.
+    /// </summary>
+    private static int Dropped(List<string> positional, Options options)
+    {
+        PathExpander.Result inputs = PathExpander.Expand(
+            positional, PathExpander.ContentExtensions, options.Recurse || positional.Any(Directory.Exists), options.All);
+
+        foreach (string missing in inputs.Missing)
+            Error($"{missing}: no such file or directory.");
+
+        if (inputs.Files.Count == 0)
+        {
+            Console.WriteLine(Usage);
+            return 2;
+        }
+
+        Console.WriteLine($"pactool: {inputs.Files.Count} file(s) to convert");
+        Console.WriteLine();
+
+        var total = new ExtractResult();
+        var claims = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
+        int failed = 0;
+
+        foreach (string path in inputs.Files)
+        {
+            string stem = Path.GetFileNameWithoutExtension(path);
+            string beside = Path.GetDirectoryName(Path.GetFullPath(path)) ?? ".";
+            string outputDirectory = ClaimDirectory(
+                Path.Combine(options.Output ?? beside, stem.Length > 0 ? stem : "output"),
+                Path.GetFileName(path), claims);
+
+            try
+            {
+                if (IsArchive(path))
+                {
+                    var single = new Options
+                    {
+                        Output = outputDirectory,
+                        Decode = true,
+                        AllMips = options.AllMips,
+                        KeepRaw = options.KeepRaw,
+                        Tpl = options.Tpl,
+                        NoJ3d = options.NoJ3d,
+                        Bdl = options.Bdl,
+                        MotionTables = options.MotionTables,
+                        Strict = options.Strict,
+                    };
+                    if (UnpackOne(path, outputDirectory, single, total) != 0)
+                        failed++;
+                }
+                else
+                {
+                    byte[] data = File.ReadAllBytes(path);
+                    total.Add(ContentExtractor.Extract(Path.GetFileName(path), data, outputDirectory,
+                                                       Options.ExtractOptions(options)));
+                }
+            }
+            catch (Exception ex) when (ex is PacFormatException or IOException or UnauthorizedAccessException)
+            {
+                failed++;
+                Error($"{path}: {ex.Message}");
+            }
+        }
+
+        Console.WriteLine();
+        ReportExtraction(total, options.Output ?? Path.GetDirectoryName(Path.GetFullPath(inputs.Files[0])) ?? ".");
+        if (failed > 0)
+            Error($"{failed} of {inputs.Files.Count} input(s) failed.");
+
+        return failed == 0 ? 0 : 1;
+    }
+
+    /// <summary>True when a file starts with the archive magic, whatever it is called.</summary>
+    private static bool IsArchive(string path)
+    {
+        try
+        {
+            using var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+            Span<byte> magic = stackalloc byte[4];
+            return stream.ReadAtLeast(magic, 4, throwOnEndOfStream: false) == 4 &&
+                   magic.SequenceEqual(PacFormat.Magic);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return false;
+        }
     }
 
     private static int List(List<string> positional, Options options)
@@ -188,14 +334,65 @@ internal static class Program
 
     private static int Unpack(List<string> positional, Options options)
     {
-        if (positional.Count != 1)
-            return UsageError("unpack takes exactly one archive.");
+        if (positional.Count == 0)
+            return UsageError("unpack takes at least one archive.");
 
-        string archivePath = positional[0];
+        PathExpander.Result inputs = PathExpander.Expand(positional, PathExpander.ArchiveExtensions,
+                                                         options.Recurse, options.All);
+        foreach (string missing in inputs.Missing)
+            Error($"{missing}: no archive there.");
+
+        if (inputs.Files.Count == 0)
+            return UsageError("nothing to unpack.");
+
+        // One archive keeps the old behaviour of writing straight into -o; several would collide
+        // there, so each gets a directory of its own named after the archive.
+        bool nested = inputs.Files.Count > 1;
+        var total = new ExtractResult();
+        var claims = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
+        int failed = 0;
+
+        foreach (string archivePath in inputs.Files)
+        {
+            string stem = Path.GetFileNameWithoutExtension(archivePath);
+            string outputDirectory = options.Output is { } chosen
+                ? (nested ? Path.Combine(chosen, stem.Length > 0 ? stem : "unpacked") : chosen)
+                : (stem.Length > 0 ? stem : "unpacked");
+            if (nested)
+                outputDirectory = ClaimDirectory(outputDirectory, Path.GetFileName(archivePath), claims);
+
+            try
+            {
+                if (nested)
+                {
+                    Console.WriteLine();
+                    Console.WriteLine(archivePath);
+                }
+
+                failed += UnpackOne(archivePath, outputDirectory, options, total);
+            }
+            catch (Exception ex) when (ex is PacFormatException or IOException or UnauthorizedAccessException)
+            {
+                failed++;
+                Error($"{archivePath}: {ex.Message}");
+            }
+        }
+
+        if (nested)
+        {
+            Console.WriteLine();
+            Console.WriteLine($"Unpacked {inputs.Files.Count - failed}/{inputs.Files.Count} archive(s).");
+            if (options.Decode)
+                ReportExtraction(total, options.Output ?? ".");
+        }
+
+        return failed == 0 ? 0 : 1;
+    }
+
+    /// <summary>Extracts one archive, and converts its members when asked to.</summary>
+    private static int UnpackOne(string archivePath, string outputDirectory, Options options, ExtractResult total)
+    {
         using var archive = PacArchive.Open(archivePath, options.Strict);
-
-        string stem = Path.GetFileNameWithoutExtension(archivePath);
-        string outputDirectory = options.Output ?? (stem.Length > 0 ? stem : "unpacked");
         Directory.CreateDirectory(outputDirectory);
 
         var used = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -265,6 +462,7 @@ internal static class Program
                 ContentExtractor.ExportRiggedModels(payloads, decodedDirectory, extractOptions, result);
 
             ReportExtraction(result, decodedDirectory);
+            total.Add(result);
         }
 
         ReportWarnings(archive);
@@ -275,18 +473,29 @@ internal static class Program
     {
         if (positional.Count == 0)
             return UsageError("decode takes at least one file.");
-        if (options.Flat && positional.Count > 1 && options.Output is null)
+
+        PathExpander.Result inputs = PathExpander.Expand(positional, PathExpander.ContentExtensions,
+                                                         options.Recurse, options.All);
+        foreach (string missing in inputs.Missing)
+            Error($"{missing}: no such file or directory.");
+
+        if (inputs.Files.Count == 0)
+            return UsageError("nothing to decode.");
+        if (options.Flat && inputs.Files.Count > 1 && options.Output is null)
             return UsageError("--flat with several inputs needs an explicit -o directory.");
 
         var total = new ExtractResult();
+        var claims = new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
         int failed = 0;
 
-        foreach (string path in positional)
+        foreach (string path in inputs.Files)
         {
             string stem = Path.GetFileNameWithoutExtension(path);
             string outputDirectory = options.Output is null
                 ? (stem.Length > 0 ? stem : "decoded")
                 : options.Flat ? options.Output : Path.Combine(options.Output, stem);
+            if (!options.Flat)
+                outputDirectory = ClaimDirectory(outputDirectory, Path.GetFileName(path), claims);
 
             try
             {
@@ -294,7 +503,7 @@ internal static class Program
                 total.Add(ContentExtractor.Extract(Path.GetFileName(path), data, outputDirectory,
                                                    Options.ExtractOptions(options)));
             }
-            catch (PacFormatException ex)
+            catch (Exception ex) when (ex is PacFormatException or IOException or UnauthorizedAccessException)
             {
                 failed++;
                 Error($"{path}: {ex.Message}");
@@ -303,17 +512,25 @@ internal static class Program
 
         Console.WriteLine();
         ReportExtraction(total, options.Output ?? ".");
+        if (failed > 0)
+            Error($"{failed} of {inputs.Files.Count} input(s) failed.");
+
         return failed == 0 ? 0 : 1;
     }
 
-    private static int Info(List<string> positional)
+    private static int Info(List<string> positional, Options options)
     {
         if (positional.Count == 0)
             return UsageError("info takes at least one file.");
 
+        PathExpander.Result inputs = PathExpander.Expand(positional, PathExpander.ContentExtensions,
+                                                         options.Recurse, options.All);
+        foreach (string missing in inputs.Missing)
+            Error($"{missing}: no such file or directory.");
+
         int failed = 0;
 
-        foreach (string path in positional)
+        foreach (string path in inputs.Files)
         {
             try
             {
@@ -451,6 +668,9 @@ internal static class Program
                               + $"{result.AnimationsWritten:N0} animation(s) written");
         }
 
+        if (result.TexturePacksWritten > 0)
+            Console.WriteLine($"  {result.TexturePacksWritten:N0} TPL texture bank(s) written");
+
         if (result.Warnings.Count > 0)
             Console.WriteLine($"  {result.Warnings.Count:N0} note(s); see the lines above");
     }
@@ -512,8 +732,16 @@ internal static class Program
         if (positional.Count == 0)
             return UsageError("verify takes at least one archive.");
 
+        PathExpander.Result inputs = PathExpander.Expand(positional, PathExpander.ArchiveExtensions,
+                                                         options.Recurse, options.All);
+        foreach (string missing in inputs.Missing)
+            Error($"{missing}: no archive there.");
+
+        if (inputs.Files.Count == 0)
+            return UsageError("nothing to verify.");
+
         int failed = 0;
-        foreach (string path in positional)
+        foreach (string path in inputs.Files)
         {
             try
             {
@@ -553,7 +781,7 @@ internal static class Program
         }
 
         Console.WriteLine();
-        Console.WriteLine($"{positional.Count - failed}/{positional.Count} archive(s) round-tripped byte for byte.");
+        Console.WriteLine($"{inputs.Files.Count - failed}/{inputs.Files.Count} archive(s) round-tripped byte for byte.");
         return failed == 0 ? 0 : 1;
     }
 
@@ -622,6 +850,34 @@ internal static class Program
         "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
     };
 
+    /// <summary>
+    /// Picks the output directory for one input, so that a batch cannot quietly write over itself.
+    ///
+    /// Inputs that share only a stem are meant to land together - a scene and the skeleton beside
+    /// it are two halves of one character - so a directory is claimed per file name rather than per
+    /// path. Two files that really do have the same name, in different folders, get a suffix.
+    /// </summary>
+    private static string ClaimDirectory(string directory, string fileName,
+                                         Dictionary<string, HashSet<string>> claims)
+    {
+        string stem = directory;
+        for (int n = 1; ; n++)
+        {
+            string candidate = n == 1 ? stem : $"{stem}~{n}";
+            if (!claims.TryGetValue(candidate, out HashSet<string>? owners))
+            {
+                claims[candidate] = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { fileName };
+                return candidate;
+            }
+
+            if (owners.Contains(fileName))
+                continue;
+
+            owners.Add(fileName);
+            return candidate;
+        }
+    }
+
     private static string Deduplicate(string fileName, HashSet<string> used)
     {
         if (used.Add(fileName))
@@ -676,6 +932,10 @@ internal static class Program
         public bool NoJ3d { get; set; }
         public bool Bdl { get; set; }
         public bool MotionTables { get; set; }
+        public bool Tpl { get; set; }
+        public bool Recurse { get; set; }
+        public bool All { get; set; }
+        public bool? Pause { get; set; }
 
         public static ExtractOptions ExtractOptions(Options options) => new()
         {
@@ -684,6 +944,7 @@ internal static class Program
             ExportJ3d = !options.NoJ3d,
             BinaryDisplayLists = options.Bdl,
             MotionTables = options.MotionTables,
+            ExportTpl = options.Tpl,
             Log = Console.WriteLine,
         };
     }
