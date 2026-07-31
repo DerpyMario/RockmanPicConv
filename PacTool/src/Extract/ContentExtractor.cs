@@ -1,4 +1,5 @@
 using System.Text;
+using PacTool.Export;
 using PacTool.Formats;
 using PacTool.Imaging;
 
@@ -12,6 +13,15 @@ public sealed class ExtractOptions
 
     /// <summary>Also write each texture's stored bytes next to its PNG.</summary>
     public bool KeepRaw { get; set; }
+
+    /// <summary>Write a .bmd and a .bck per motion when a scene and a skeleton pair up.</summary>
+    public bool ExportJ3d { get; set; } = true;
+
+    /// <summary>Write the .bdl variant tag rather than .bmd.</summary>
+    public bool BinaryDisplayLists { get; set; }
+
+    /// <summary>Also write each motion's frames as CSV.</summary>
+    public bool MotionTables { get; set; }
 
     /// <summary>Receives one line per decoded item.</summary>
     public Action<string> Log { get; set; } = _ => { };
@@ -29,6 +39,12 @@ public sealed class ExtractResult
     /// <summary>Meshes decoded to OBJ.</summary>
     public int MeshesWritten { get; set; }
 
+    /// <summary>Rigged models written as J3D.</summary>
+    public int ModelsWritten { get; set; }
+
+    /// <summary>Animations written as BCK.</summary>
+    public int AnimationsWritten { get; set; }
+
     /// <summary>Items whose format was not recognised and were copied verbatim.</summary>
     public int Unrecognised { get; set; }
 
@@ -41,6 +57,8 @@ public sealed class ExtractResult
         FilesWritten += other.FilesWritten;
         ImagesWritten += other.ImagesWritten;
         MeshesWritten += other.MeshesWritten;
+        ModelsWritten += other.ModelsWritten;
+        AnimationsWritten += other.AnimationsWritten;
         Unrecognised += other.Unrecognised;
         Warnings.AddRange(other.Warnings);
     }
@@ -130,14 +148,104 @@ public static class ContentExtractor
         options.Log($"{name}: CAPR archive, {archive.Members.Count} member(s)");
         var used = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
+        var payloads = new Dictionary<string, byte[]>(StringComparer.OrdinalIgnoreCase);
         foreach (PacMember member in archive.Members)
         {
+            byte[] payload = archive.ReadMember(member);
+            payloads[member.Name] = payload;
             string stem = Deduplicate(SafeName(member.Name), used);
-            result.Add(Extract(member.Name, archive.ReadMember(member),
-                               Path.Combine(outputDirectory, stem), options));
+            result.Add(Extract(member.Name, payload, Path.Combine(outputDirectory, stem), options));
         }
 
+        if (options.ExportJ3d)
+            ExportRiggedModels(payloads, outputDirectory, options, result);
+
         return result;
+    }
+
+    /// <summary>
+    /// Joins each scene with the skeleton of the same stem and writes the pair out as J3D. A
+    /// character model is split across two members - the geometry and rest poses in the
+    /// <c>.scn</c>, the joints and animations in the <c>.mpc</c> - so neither is exportable alone.
+    /// </summary>
+    public static void ExportRiggedModels(IReadOnlyDictionary<string, byte[]> payloads, string outputDirectory,
+                                          ExtractOptions options, ExtractResult result)
+    {
+        foreach ((string name, byte[] data) in payloads)
+        {
+            if (!name.EndsWith(".scn", StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            string stem = Path.GetFileNameWithoutExtension(name);
+            if (!payloads.TryGetValue(stem + ".mpc", out byte[]? skeletonData))
+                continue;
+
+            try
+            {
+                PicturePack pack = PicturePack.Parse(data, name);
+                if (pack.Scene is not { } scene)
+                    continue;
+
+                foreach (SceneRecord shape in scene.Shapes)
+                {
+                    shape.Mesh ??= shape.Kind == SceneRecordKind.SkinnedShape
+                        ? ScnMesh.DecodeSkinned(shape.Geometry!, shape.VertexCount, shape.TriangleCount, shape.PrimitiveCount)
+                        : ScnMesh.DecodeDisplayList(shape.Geometry!, shape.VertexCount, shape.TriangleCount);
+                }
+
+                MpcModel skeleton = MpcModel.Parse(skeletonData, stem + ".mpc");
+                RiggedModel model = RiggedModel.Assemble(stem, scene, skeleton,
+                                                         pack.Textures.Select(t => t.Name).ToList());
+                if (model.Meshes.Count == 0 || model.Joints.Count == 0)
+                    continue;
+
+                WriteRiggedModel(model, pack, Path.Combine(outputDirectory, SafeName(stem) + ".model"), options, result);
+            }
+            catch (PacFormatException ex)
+            {
+                result.Warnings.Add($"{stem}: {ex.Message}");
+                options.Log($"    note: {stem}: {ex.Message}");
+            }
+        }
+    }
+
+    private static void WriteRiggedModel(RiggedModel model, PicturePack pack, string outputDirectory,
+                                         ExtractOptions options, ExtractResult result)
+    {
+        Directory.CreateDirectory(outputDirectory);
+        Report(model.Name, model.Warnings, options, result);
+
+        options.Log($"  {model.Name + " (rigged)",-20} {model.Joints.Count} joint(s), {model.PosedJointCount} posed, " +
+                    $"{model.Meshes.Count} mesh(es), {model.Motions.Count} motion(s)");
+
+        WriteText(Path.Combine(outputDirectory, "skeleton.txt"), model.DescribeSkeleton(), result);
+
+        string extension = options.BinaryDisplayLists ? ".bdl" : ".bmd";
+        Write(Path.Combine(outputDirectory, model.Name + extension),
+              BmdWriter.Build(model, pack.Textures, options.BinaryDisplayLists), result);
+        result.ModelsWritten++;
+
+        if (model.Motions.Count == 0)
+            return;
+
+        WriteText(Path.Combine(outputDirectory, "motions.txt"),
+                  MpcMotion.Describe(model.Name, model.Motions), result);
+
+        string animationDirectory = Path.Combine(outputDirectory, "animation");
+        Directory.CreateDirectory(animationDirectory);
+        var used = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var jointNames = model.Joints.Select(j => j.Name).ToList();
+
+        foreach (MpcMotion motion in model.Motions)
+        {
+            string stem = Deduplicate(SafeName(motion.Name), used);
+            Write(Path.Combine(animationDirectory, stem + ".bck"),
+                  BckWriter.Build(motion, model.Joints.Count), result);
+            result.AnimationsWritten++;
+
+            if (options.MotionTables)
+                WriteText(Path.Combine(animationDirectory, stem + ".csv"), motion.DescribeFrames(jointNames), result);
+        }
     }
 
     private static void ExtractPicturePack(string name, byte[] data, string outputDirectory,
@@ -261,12 +369,37 @@ public static class ContentExtractor
         Directory.CreateDirectory(outputDirectory);
         Report(name, model.Warnings, options, result);
 
-        options.Log($"  {name,-20} MPC model, {model.Nodes.Count} node(s), root '{model.RootName}', " +
-                    $"{model.MeshData.Length:N0} B mesh data");
+        options.Log($"  {name,-20} MPC skeleton, {model.Nodes.Count} joint(s), root '{model.RootName}', " +
+                    $"{model.Motions.Count} motion(s)");
 
         WriteText(Path.Combine(outputDirectory, "skeleton.txt"), model.DescribeSkeleton(name), result);
         Write(Path.Combine(outputDirectory, "skeleton.bin"), model.SkeletonData, result);
-        Write(Path.Combine(outputDirectory, "mesh.bin"), model.MeshData, result);
+
+        if (options.KeepRaw || model.Motions.Count == 0)
+            Write(Path.Combine(outputDirectory, "motiondata.bin"), model.MeshData, result);
+        if (model.Motions.Count == 0)
+            return;
+
+        WriteText(Path.Combine(outputDirectory, "motions.txt"), MpcMotion.Describe(name, model.Motions), result);
+        if (!options.ExportJ3d)
+            return;
+
+        // A skeleton on its own is enough for an animation, even without the scene that goes with
+        // it, so these are written whether or not a paired .scn turned up.
+        string animationDirectory = Path.Combine(outputDirectory, "animation");
+        Directory.CreateDirectory(animationDirectory);
+        var used = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var jointNames = model.Nodes.Select(n => n.Name).ToList();
+
+        foreach (MpcMotion motion in model.Motions)
+        {
+            string stem = Deduplicate(SafeName(motion.Name), used);
+            Write(Path.Combine(animationDirectory, stem + ".bck"),
+                  BckWriter.Build(motion, model.Nodes.Count), result);
+            result.AnimationsWritten++;
+            if (options.MotionTables)
+                WriteText(Path.Combine(animationDirectory, stem + ".csv"), motion.DescribeFrames(jointNames), result);
+        }
     }
 
     private static void ExtractDirectory(string name, byte[] data, string outputDirectory,

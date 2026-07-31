@@ -111,7 +111,7 @@ public class ContentExtractorTests : IDisposable
     public void AJ3dModelYieldsItsSectionsAndItsTextures()
     {
         byte[] model = J3dBuilder.Build("bmd3", [
-            J3dBuilder.NameSection("JNT1", 0x0C, ["root"]),
+            J3dBuilder.NameSection("JNT1", 0x14, ["root"]),
             J3dBuilder.Tex1([("bark", GxTextureFormat.Rgb565, 8, 8)]),
         ]);
 

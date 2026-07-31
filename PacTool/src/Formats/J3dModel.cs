@@ -144,7 +144,9 @@ public sealed class J3dModel
                         textures.AddRange(ParseTex1(section, sourceName, warnings));
                         break;
                     case "JNT1":
-                        jointNames.AddRange(ReadNameTable(section, 0x0C, sourceName, warnings));
+                        // JNT1 keeps three offsets after its count: joint data, the remap
+                        // table, then the names.
+                        jointNames.AddRange(ReadNameTable(section, 0x14, sourceName, warnings));
                         break;
                     case "MAT3":
                         materialNames.AddRange(ReadNameTable(section, 0x14, sourceName, warnings));

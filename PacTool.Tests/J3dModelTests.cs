@@ -17,7 +17,7 @@ public class J3dModelTests
     public void ABmdIsRecognisedAndItsSectionsInventoried()
     {
         byte[] model = J3dBuilder.Build("bmd3", [
-            J3dBuilder.NameSection("JNT1", 0x0C, ["root", "arm_l", "arm_r"]),
+            J3dBuilder.NameSection("JNT1", 0x14, ["root", "arm_l", "arm_r"]),
             J3dBuilder.NameSection("MAT3", 0x14, ["skin", "cloth"]),
             J3dBuilder.Tex1([("grass", GxTextureFormat.Rgb565, 8, 8)]),
         ]);
@@ -80,7 +80,7 @@ public class J3dModelTests
     public void TheSceneGraphIsFlattenedWithItsNestingPreserved()
     {
         byte[] model = J3dBuilder.Build("bmd3", [
-            J3dBuilder.NameSection("JNT1", 0x0C, ["root", "child"]),
+            J3dBuilder.NameSection("JNT1", 0x14, ["root", "child"]),
             J3dBuilder.Inf1([(1, 0), (0x10, 0), (1, 0), (0x10, 1), (0x11, 3), (2, 0), (2, 0), (0, 0)]),
         ]);
 

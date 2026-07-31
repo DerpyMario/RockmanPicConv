@@ -32,7 +32,7 @@ internal static class J3dBuilder
 
     /// <summary>
     /// A section whose only content is a string table, pointed at from
-    /// <paramref name="pointerOffset"/>. JNT1 keeps that pointer at 0x0C and MAT3 at 0x14.
+    /// <paramref name="pointerOffset"/>. JNT1 and MAT3 both keep that pointer at 0x14.
     /// </summary>
     public static byte[] NameSection(string magic, int pointerOffset, IReadOnlyList<string> names)
     {

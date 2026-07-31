@@ -31,7 +31,7 @@ internal static class Program
           .pac         every member, each into its own directory
           .pcp / .scn  Picture Pack textures to PNG; a .scn also yields its scene table
                        and its GX display list geometry as Wavefront OBJ
-          .mpc         skeleton hierarchy as text, plus the packed mesh data
+          .mpc         joint hierarchy and motion list as text, plus a .bck per animation
           map/bg/enemy.dat   stage object, background and spawn directories as text
           .bmd / .bdl  J3D models: section inventory, scene graph, and TEX1 textures to PNG
           .bti         a standalone GameCube texture to PNG
@@ -43,6 +43,9 @@ internal static class Program
           --decode     unpack also converts each member's contents, into <dir>/decoded/
           --mips       write every mip level, not only the base one
           --raw        keep the stored bytes too: each texture's, and each display list's
+          --no-j3d     skip the .bmd and .bck export
+          --bdl        write .bdl rather than .bmd
+          --motion-csv also write each motion's frames as CSV
           --flat       decode writes straight into -o rather than one directory per input
           --align <n>  pad each payload up to a multiple of n bytes (default 32)
           --no-align   store payloads at their exact length
@@ -128,6 +131,15 @@ internal static class Program
                     break;
                 case "--flat":
                     options.Flat = true;
+                    break;
+                case "--no-j3d":
+                    options.NoJ3d = true;
+                    break;
+                case "--bdl":
+                    options.Bdl = true;
+                    break;
+                case "--motion-csv":
+                    options.MotionTables = true;
                     break;
                 default:
                     if (arg.StartsWith('-'))
@@ -236,12 +248,21 @@ internal static class Program
             string decodedDirectory = Path.Combine(outputDirectory, "decoded");
             Console.WriteLine();
             var result = new ExtractResult();
+            ExtractOptions extractOptions = Options.ExtractOptions(options);
+
+            // Members are kept as they are read so that a scene and the skeleton of the same stem
+            // can be joined afterwards; neither half is a character model on its own.
+            var payloads = new Dictionary<string, byte[]>(StringComparer.OrdinalIgnoreCase);
             foreach (PacMember member in archive.Members)
             {
+                byte[] payload = archive.ReadMember(member);
+                payloads[member.Name] = payload;
                 string memberDirectory = Path.Combine(decodedDirectory, ContentExtractor.SafeName(member.Name));
-                result.Add(ContentExtractor.Extract(member.Name, archive.ReadMember(member),
-                                                    memberDirectory, Options.ExtractOptions(options)));
+                result.Add(ContentExtractor.Extract(member.Name, payload, memberDirectory, extractOptions));
             }
+
+            if (extractOptions.ExportJ3d)
+                ContentExtractor.ExportRiggedModels(payloads, decodedDirectory, extractOptions, result);
 
             ReportExtraction(result, decodedDirectory);
         }
@@ -424,6 +445,12 @@ internal static class Program
         Console.WriteLine($"Wrote {result.FilesWritten:N0} file(s) to {Path.GetFullPath(outputDirectory)}");
         Console.WriteLine($"  {result.ImagesWritten:N0} image(s) and {result.MeshesWritten:N0} mesh(es) decoded, "
                           + $"{result.Unrecognised:N0} item(s) copied verbatim");
+        if (result.ModelsWritten > 0 || result.AnimationsWritten > 0)
+        {
+            Console.WriteLine($"  {result.ModelsWritten:N0} J3D model(s) and "
+                              + $"{result.AnimationsWritten:N0} animation(s) written");
+        }
+
         if (result.Warnings.Count > 0)
             Console.WriteLine($"  {result.Warnings.Count:N0} note(s); see the lines above");
     }
@@ -646,11 +673,17 @@ internal static class Program
         public bool AllMips { get; set; }
         public bool KeepRaw { get; set; }
         public bool Flat { get; set; }
+        public bool NoJ3d { get; set; }
+        public bool Bdl { get; set; }
+        public bool MotionTables { get; set; }
 
         public static ExtractOptions ExtractOptions(Options options) => new()
         {
             AllMips = options.AllMips,
             KeepRaw = options.KeepRaw,
+            ExportJ3d = !options.NoJ3d,
+            BinaryDisplayLists = options.Bdl,
+            MotionTables = options.MotionTables,
             Log = Console.WriteLine,
         };
     }

@@ -41,6 +41,9 @@ public sealed class MpcModel
     /// <summary>Size of one skeleton entry.</summary>
     public const int EntrySize = 0x18;
 
+    /// <summary>Offset of the entry-shaped record in the header, which is joint 0.</summary>
+    public const int RootRecordOffset = 0x08;
+
     /// <summary>Name of the root chain node, from the entry-shaped record in the header.</summary>
     public string RootName { get; }
 
@@ -50,21 +53,25 @@ public sealed class MpcModel
     /// <summary>Skeleton entries in stored (depth-first) order.</summary>
     public IReadOnlyList<MpcNode> Nodes { get; }
 
+    /// <summary>Animations stored after the skeleton.</summary>
+    public IReadOnlyList<MpcMotion> Motions { get; }
+
     /// <summary>The skeleton table, verbatim.</summary>
     public byte[] SkeletonData { get; }
 
-    /// <summary>The packed mesh data that follows the skeleton.</summary>
+    /// <summary>Everything after the skeleton: the motion directory and the motions themselves.</summary>
     public byte[] MeshData { get; }
 
     /// <summary>Non-fatal oddities noticed while parsing.</summary>
     public IReadOnlyList<string> Warnings { get; }
 
-    private MpcModel(string rootName, uint unknown, List<MpcNode> nodes,
+    private MpcModel(string rootName, uint unknown, List<MpcNode> nodes, List<MpcMotion> motions,
                      byte[] skeleton, byte[] mesh, List<string> warnings)
     {
         RootName = rootName;
         Unknown = unknown;
         Nodes = nodes;
+        Motions = motions;
         SkeletonData = skeleton;
         MeshData = mesh;
         Warnings = warnings;
@@ -76,8 +83,8 @@ public sealed class MpcModel
         if (data.Length < EntryTableOffset + EntrySize)
             return false;
 
-        uint count = BinaryPrimitives.ReadUInt32BigEndian(data);
-        if (count == 0 || count > 0x1000 || EntryTableOffset + (long)count * EntrySize > data.Length)
+        uint stored = BinaryPrimitives.ReadUInt32BigEndian(data);
+        if (stored < 2 || stored > 0x1000 || EntryTableOffset + (long)(stored - 1) * EntrySize > data.Length)
             return false;
 
         // The first entry is always the single root bone, type 1, with a name.
@@ -91,7 +98,10 @@ public sealed class MpcModel
         if (data.Length < EntryTableOffset)
             throw new PacFormatException($"{sourceName}: {data.Length} bytes is too short for an MPC header.");
 
-        long count = BinaryPrimitives.ReadUInt32BigEndian(data);
+        // The stored count includes the entry-shaped root chain record in the header, so the
+        // table itself holds one fewer. Reading it as the table length runs a whole entry past the
+        // end and into the motion directory.
+        long count = Math.Max(0, (long)BinaryPrimitives.ReadUInt32BigEndian(data) - 1);
         uint unknown = BinaryPrimitives.ReadUInt32BigEndian(data[4..]);
         var warnings = new List<string>();
 
@@ -103,26 +113,51 @@ public sealed class MpcModel
             skeletonEnd = EntryTableOffset + count * EntrySize;
         }
 
-        var nodes = new List<MpcNode>((int)count);
+        // Joint 0 is the entry-shaped record in the header, not the first table entry: the skin
+        // weights in the paired .scn index it, and its name appears among that file's rest poses
+        // in all 178 models that have both. Everything in the table hangs below it, so the table's
+        // own depths shift down by one.
+        var nodes = new List<MpcNode>((int)count + 1)
+        {
+            new()
+            {
+                Index = 0,
+                Flags = BinaryPrimitives.ReadUInt16BigEndian(data[RootRecordOffset..]),
+                Type = MpcNodeType.RootChain,
+                Name = Ascii.Decode(data.Slice(RootRecordOffset + 3, 8)),
+                GeometryWord = 0,
+                Parameter = 0,
+                DepthOverride = 0,
+                Raw = data.Slice(RootRecordOffset, EntrySize).ToArray(),
+            },
+        };
+
         for (int i = 0; i < count; i++)
         {
             ReadOnlySpan<byte> entry = data.Slice(EntryTableOffset + i * EntrySize, EntrySize);
-            nodes.Add(new MpcNode
+            var node = new MpcNode
             {
-                Index = i,
+                Index = nodes.Count,
                 Flags = BinaryPrimitives.ReadUInt16BigEndian(entry),
                 Type = (MpcNodeType)entry[2],
                 Name = Ascii.Decode(entry[3..11]),
                 GeometryWord = BinaryPrimitives.ReadUInt16BigEndian(entry[0x14..]),
                 Parameter = BinaryPrimitives.ReadInt16BigEndian(entry[0x16..]),
                 Raw = entry.ToArray(),
-            });
+            };
+            node.DepthOverride = node.TypeDepth + 1;
+            nodes.Add(node);
         }
+
+        // The motions animate the table joints; joint 0, the header chain, is driven by the
+        // whole-model track instead.
+        List<MpcMotion> motions = MpcMotion.ParseAll(data, (int)skeletonEnd, nodes.Count - 1, warnings);
 
         return new MpcModel(
             Ascii.Decode(data.Slice(0x0B, 8)),
             unknown,
             nodes,
+            motions,
             data[EntryTableOffset..(int)skeletonEnd].ToArray(),
             data[(int)skeletonEnd..].ToArray(),
             warnings);
@@ -168,7 +203,10 @@ public sealed class MpcModel
 /// </summary>
 public enum MpcNodeType
 {
-    /// <summary>The single root bone, always the first entry.</summary>
+    /// <summary>The record in the header: the chain every other joint hangs below.</summary>
+    RootChain = 0x00,
+
+    /// <summary>The single root bone, always the first table entry.</summary>
     RootBone = 0x01,
 
     /// <summary>Effect node directly under the root.</summary>
@@ -260,6 +298,7 @@ public sealed class MpcNode
     /// <summary>Role of this node.</summary>
     public MpcNodeCategory Category => Type switch
     {
+        MpcNodeType.RootChain => MpcNodeCategory.Chain,
         MpcNodeType.RootBone => MpcNodeCategory.Bone,
         MpcNodeType.ChainA or MpcNodeType.ChainB or MpcNodeType.ChainC or MpcNodeType.ChainD => MpcNodeCategory.Chain,
         MpcNodeType.PartA or MpcNodeType.PartB or MpcNodeType.PartC or MpcNodeType.PartC2 or MpcNodeType.PartD => MpcNodeCategory.Part,
@@ -267,10 +306,16 @@ public sealed class MpcNode
         _ => MpcNodeCategory.Unknown,
     };
 
-    /// <summary>Depth in the skeleton tree, derived from <see cref="Type"/>.</summary>
-    public int Depth => Type switch
+    /// <summary>Depth in the skeleton tree. Set when the model is parsed.</summary>
+    public int Depth => DepthOverride ?? TypeDepth;
+
+    /// <summary>Depth assigned at parse time, which offsets the table below the root joint.</summary>
+    public int? DepthOverride { get; set; }
+
+    /// <summary>Depth the node type on its own implies.</summary>
+    public int TypeDepth => Type switch
     {
-        MpcNodeType.RootBone => 0,
+        MpcNodeType.RootChain or MpcNodeType.RootBone => 0,
         MpcNodeType.EffectTop or MpcNodeType.ChainA => 1,
         MpcNodeType.PartA or MpcNodeType.ChainB => 2,
         MpcNodeType.EffectA or MpcNodeType.PartB or MpcNodeType.ChainC => 3,
