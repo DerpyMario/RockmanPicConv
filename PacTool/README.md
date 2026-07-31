@@ -38,27 +38,68 @@ Verified invariants across all 203 archives:
 
 ```
 dotnet build -c Release          # produces bin/Release/net8.0/pactool
-dotnet test                      # 195 tests, from the solution root
+dotnet test                      # 219 tests, from the solution root
 ```
 
 Targets .NET 8. The tool itself has **no external dependencies** — the GX texture decoders and the
 PNG encoder are part of the project, so nothing has to be restored to convert a texture. Only the
 test project pulls in xunit.
 
+For a single file to drag things onto:
+
+```
+dotnet publish -c Release -r win-x64 --self-contained false -p:PublishSingleFile=true
+```
+
 ## Usage
 
 ```
 pactool list   <archive.pac> [--json]
-pactool unpack <archive.pac> [-o <dir>] [--decode] [--no-manifest] [--strict]
+pactool unpack <input> [<input> ...] [-o <dir>] [--decode] [--no-manifest] [--strict]
 pactool pack   <input> <archive.pac> [--align <n>] [--no-align]
-pactool verify <archive.pac> [<archive.pac> ...] [--strict]
-pactool decode <file> [<file> ...] [-o <dir>] [--mips] [--raw] [--flat]
-                                   [--no-j3d] [--bdl] [--motion-csv]
-pactool info   <file> [<file> ...]
+pactool verify <input> [<input> ...] [--strict]
+pactool decode <input> [<input> ...] [-o <dir>] [--mips] [--raw] [--tpl] [--flat]
+                                     [--no-j3d] [--bdl] [--motion-csv]
+pactool info   <input> [<input> ...]
 ```
 
 `list`, `unpack`, `pack` and `verify` treat payloads as opaque bytes and round-trip them exactly.
 `decode` and `info` look inside.
+
+### Batch input
+
+Every `<input>` may be a file, a directory or a wildcard, and a command takes as many as you like:
+
+```
+$ pactool decode files -r -o out            # a whole extracted disc
+$ pactool verify "files/StageData/Stage0*.pac"
+$ pactool unpack files/StageData -o unpacked --decode
+```
+
+A directory contributes the files inside it that the command handles — `.pac` for the archive
+commands, and `.pac .pcp .scn .mpc .bmd .bdl .bti .pic .dat .tpl` for `decode` and `info`. Add
+`--recurse` (`-r`) to go into subdirectories, or `--all` to take every file whatever it is called.
+A file named outright is always taken, extension or not, since naming it is the request.
+
+Wildcards are expanded by the tool as well as by the shell, because the Windows shell does not do
+it and passes the pattern through unchanged.
+
+Two inputs that would write to the same place no longer overwrite each other. Inputs that share
+only a stem are meant to land together — `m01xxxxx.scn` and `m01xxxxx.mpc` are two halves of one
+character — so the output directory is claimed per file name; a genuine repeat, like the two
+`EnvMap.pcp` in different folders, gets a `~2` suffix.
+
+### Drag and drop
+
+Dropping files or folders onto the executable runs them with no command at all. Archives are
+unpacked *and* converted, everything else is converted, and output lands **beside each input**
+rather than in the working directory — a process started from a file manager inherits a working
+directory that has nothing to do with where the files came from.
+
+The window then waits for a key, because a console created for the process is destroyed the moment
+it exits and would take the whole report with it. That is decided by asking Windows how many
+processes are attached to the console: exactly one means nobody was there before this run.
+`--pause` and `--no-pause` override it either way.
 
 ### Unpack and pack
 
@@ -124,14 +165,16 @@ Wrote 300 file(s) to .../out
 | `.bmd` / `.bdl` | `model.txt`, `sections/*.bin`, `textures/*.png` |
 | `.bti` | `<name>.png` |
 | `.pic` | `<name>.png` |
+| anything with textures, under `--tpl` | `<container>.tpl` and `<container>.tpl.txt` beside the PNGs |
 | anything else | copied out verbatim |
 
 `--mips` writes every mip level (`tex.png`, `tex.mip1.png`, …) rather than only the base one;
-`--raw` keeps the stored bytes too — each texture's, and each display list's. `--no-j3d` skips the
-`.bmd` and `.bck` export, `--bdl` writes the `bdl4` variant instead of `bmd3`, and `--motion-csv`
-writes each animation's frames out as a table beside it. Yaz0-compressed input is decompressed
-before it is identified. `unpack --decode` does both jobs at once, putting the converted files in
-`<dir>/decoded/` so that packing the unpack directory back up is unaffected.
+`--raw` keeps the stored bytes too — each texture's, and each display list's. `--tpl` also writes
+each container's textures as a TPL texture bank. `--no-j3d` skips the `.bmd` and `.bck` export,
+`--bdl` writes the `bdl4` variant instead of `bmd3`, and `--motion-csv` writes each animation's
+frames out as a table beside it. Yaz0-compressed input is decompressed before it is identified.
+`unpack --decode` does both jobs at once, putting the converted files in `<dir>/decoded/` so that
+packing the unpack directory back up is unaffected.
 
 `info` prints the same analysis without writing anything:
 
@@ -426,6 +469,60 @@ interpolates linearly through; a component that never changes collapses to one c
 is most of them. Skeleton joint 0 takes the whole-model track, since the motions animate the table
 joints only.
 
+### Writing TPL texture banks
+
+A Picture Pack is already a bank of GX textures in all but name, and TPL is the bank format the
+GameCube and Wii SDKs load directly — so `--tpl` writes one TPL per container, holding every
+texture in it. **The mip chains are copied across byte for byte.** Nothing is re-encoded, requantised
+or recompressed; only the headers around the data are new, so a `CMPR` texture that came out of the
+game goes into the TPL as the same 11,008 bytes it always was.
+
+```
+file header
+0x00  u32  version        0x0020AF30
+0x04  u32  textureCount
+0x08  u32  headerSize     0x0C, which is also where the descriptors start
+
+descriptor, one per texture
+0x00  u32  imageHeaderOffset      absolute, from the start of the file
+0x04  u32  paletteHeaderOffset    absolute, or 0 when the format is not paletted
+
+image header (0x24)              palette header (0x0C)
+0x00  u16  height                 0x00  u16  entryCount
+0x02  u16  width                  0x02  u8   unpacked
+0x04  u32  format                 0x03  u8   padding
+0x08  u32  imageDataOffset        0x04  u32  format
+0x0C  u32  wrapS                  0x08  u32  paletteDataOffset
+0x10  u32  wrapT
+0x14  u32  minFilter
+0x18  u32  magFilter
+0x1C  f32  lodBias
+0x20  u8   edgeLodEnable
+0x21  u8   minLod
+0x22  u8   maxLod
+0x23  u8   unpacked
+```
+
+Height comes before width, which is the other way round from every other header in this repository.
+Every offset is from the start of the file: the SDK's loader walks the descriptors and turns each
+one into a pointer by adding the base address. It takes the descriptors from offset 12 outright
+rather than from the header size at 0x08, so that field is written for the tools that do read it
+and is otherwise inert. Image and palette data are aligned to 32 bytes, which is what the hardware
+wants; palette entries are two bytes each. The wrap modes and filters are the same GX enumerations
+the Picture Pack and BTI headers already store, so they cross over unchanged.
+
+Two details are worth stating because getting them wrong produces a file that opens and then reads
+off the end. A chain is advertised through `maxLod` alone, and it is set from what the data
+**actually** holds rather than from what the source header claimed — a texture truncated by damaged
+input says two levels, not four. And a paletted format is refused outright if no TLUT came with it,
+rather than written with a null palette pointer.
+
+Softimage PIC source art is the one thing here that never was a GX texture, so it is the one thing
+that has to be encoded rather than copied. It becomes `RGBA8` — the only GX format that keeps every
+colour and every alpha value exactly, so nothing is lost on the way. Every other format would have
+quantised, dropped alpha or block-compressed, and a converter that silently degraded an image would
+be worse than one that declines to.
+
 ### Softimage PIC (`.pic`)
 
 The source art the effect textures were authored from — 99 of them under
@@ -470,10 +567,10 @@ a `PIC\0` magic and 16-byte descriptors that no shipped `.pcp` has.
 - Texture decoding against `mmnt_pac_extract_full.py`'s own PNGs — **141/141**, differing only in
   the tile the reference truncates.
 - Mip-chain sizing against every texture header in the reference data — **3048/3048**.
-- `decode` over every `.pac`, `.pcp`, `.scn`, `.mpc` and `.pic` in `files.7z` — 17,893 files
-  written, 3147 images and 8536 meshes, 12 items copied verbatim (the `playdemo*.dat` input
-  recordings, whose format is not known), no crashes and 197 notes: 178 saying how many joints of a
-  model have no rest pose, and 19 motions that do not fit before the next one.
+- `decode files -r --tpl` over the whole reference tree — 19,475 files written, 3147 images and
+  8536 meshes, 12 items copied verbatim (the `playdemo*.dat` input recordings, whose format is not
+  known), no crashes and 197 notes: 178 saying how many joints of a model have no rest pose, and 19
+  motions that do not fit before the next one.
 - Geometry decoding — **8536/8536** shapes, 641,480 triangles. Spot checks hold up
   geometrically: `roomconv.scn`'s `cube1M0` has 24 vertices at exactly 8 distinct corners, and its
   `scballM0` is a sphere whose radius from the bounding-box centre varies only between 3.398 and
@@ -482,15 +579,23 @@ a `PIC\0` magic and 16-byte descriptors that no shipped `.pcp` has.
   back through an independent Python validator written against blemd's read order: section chain,
   string tables, every array bound, every index in range, packet matrix counts within the hardware
   limit, and a single-rooted scene graph. **178/178** and **1855/1855** pass.
-- 195 unit tests. The J3D and Yaz0 fixtures are constructed rather than sampled, since the
+- TPL export — 791 banks holding 3147 textures. A second Python validator parses each one the way
+  the SDK's own loader does, then decodes every texture from scratch and compares it against the
+  PNG this tool wrote from the same source: **791/791** valid and **3147/3147** pixel-identical.
+  That covers the 99 Softimage PIC files too, which are the only ones encoded rather than copied,
+  so it is also the round-trip check on the RGBA8 encoder.
+- 219 unit tests. The J3D, TPL and Yaz0 fixtures are constructed rather than sampled, since the
   reference data contains neither; the BMD writer is checked by reading its output back through
-  this repository's own J3D reader, and the BCK writer through a separate reader in the tests.
+  this repository's own J3D reader, and the BCK and TPL writers through separate readers in the
+  tests.
 
 ## Notes and edge cases
 
 - **Duplicate names.** Extraction disambiguates on disk (`EnvMap.pcp`, `EnvMap~2.pcp`) while
   `pac.json` keeps the original stored name for each. A warning tells you to rebuild from the
-  manifest rather than the `.lst` in that case.
+  manifest rather than the `.lst` in that case. The same applies across a batch: two inputs with
+  the same file name in different folders get separate output directories, while a scene and the
+  skeleton that goes with it still land together.
 - **Untrusted names.** Names come from the archive, so path separators and `..` are replaced before
   anything is created on disk, for both members and the texture names inside them.
 - **Long names.** The name field holds 16 bytes; packing a longer name is a hard error rather than
@@ -518,6 +623,7 @@ src/Program.cs                  CLI
 
 src/Gx/GxTextureFormat.cs       GX formats: tile geometry, bit depth, mip chain sizes
 src/Gx/GxImageDecoder.cs        all eleven GX texture formats to RGBA
+src/Gx/GxImageEncoder.cs        RGBA back to RGBA8, for images that never were GX data
 src/Gx/GxPalette.cs             TLUT decoding
 src/Gx/GxVertexFormat.cs        vertex descriptor and attribute table: sizes and offsets
 src/Gx/GxDisplayList.cs         the FIFO opcode stream
@@ -541,10 +647,14 @@ src/Formats/BtiTexture.cs       BTI texture header, standalone and inside TEX1
 src/Formats/SoftimagePic.cs     .pic source art
 src/Formats/Yaz0.cs             Nintendo's run-length compression
 
-src/Export/J3dWriter.cs         big-endian output with the offset patching J3D needs
+src/Export/BigEndianOutput.cs   big-endian output with the offset patching these formats need
 src/Export/BmdGeometry.cs       welding, weight tables and packet splitting
 src/Export/BmdWriter.cs         .bmd / .bdl output
 src/Export/BckWriter.cs         .bck skeletal animation output
+src/Export/TplWriter.cs         .tpl texture bank output
+
+src/Cli/PathExpander.cs         directories, wildcards and batch input
+src/Cli/ConsoleSession.cs       telling a dropped run from one typed at a prompt
 
 src/Extract/ContentExtractor.cs orchestration: what gets written where
 src/Extract/ObjWriter.cs        Wavefront OBJ output
@@ -562,6 +672,9 @@ and the per-attribute size rules — were taken from these and then checked agai
 - [MeltyTool / FinModelUtility](https://github.com/MeltyPlayer/MeltyTool) — a second implementation
   of GameCube model and display list reading, useful as a cross-check on the GX conventions. It
   does not cover this game.
+- [libogc](https://github.com/devkitPro/libogc) — `gc/ogc/tpl.h` and `libogc/tpl.c` for the TPL
+  container: the version word, the descriptor pairs, and the exact field order of the image and
+  palette headers, including that height comes before width.
 - [blemd](https://github.com/niacdoial/blemd) — a Blender importer for J3D. Its readers are the
   reference for what the writers here produce: `Shp1.py` for the batch, packet, matrix data and
   packet location records, `Mat3.py` for the 332-byte material record and the tables it indexes,

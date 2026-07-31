@@ -315,6 +315,11 @@ public class SoftimagePicTests
     private static (byte, byte, byte, byte) Pixel(Rgba32Image image, int x, int y) =>
         GxImageDecoderTests.PixelAt(image, x, y);
 
+    /// <summary>A PIC of one flat colour, for tests that only care that there is an image.</summary>
+    internal static byte[] Solid(int width, int height) => Build(width, height,
+        rgb: writer => writer.U8(127 + width).Bytes([64, 128, 192]),
+        alpha: writer => writer.U8(127 + width).U8(255));
+
     private static byte[] Build(int width, int height, Action<BigEndianWriter> rgb, Action<BigEndianWriter> alpha)
     {
         var writer = new BigEndianWriter()

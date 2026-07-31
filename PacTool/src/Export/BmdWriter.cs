@@ -44,7 +44,7 @@ public static class BmdWriter
             Tex1(textures),
         };
 
-        var file = new J3dWriter();
+        var file = new BigEndianOutput();
         file.Ascii("J3D1").Ascii(binaryDisplayLists ? "bdl4" : "bmd3");
         file.U32(0).U32(sections.Count);
         file.Ascii("SVR3").Fill(12, 0xFF);
@@ -65,7 +65,7 @@ public static class BmdWriter
     /// </summary>
     private static byte[] Inf1(RiggedModel model, BmdGeometry geometry)
     {
-        var w = new J3dWriter();
+        var w = new BigEndianOutput();
         w.Ascii("INF1").U32(0);
         w.U16(0).U16(0xFFFF);                       // scene loading flags
         w.U32(geometry.PacketCount);
@@ -109,7 +109,7 @@ public static class BmdWriter
     }
 
     /// <summary>Writes one joint and, below it, its children - and at the root, the shapes.</summary>
-    private static void EmitJoint(J3dWriter w, int joint, List<List<int>> children,
+    private static void EmitJoint(BigEndianOutput w, int joint, List<List<int>> children,
                                   BmdGeometry geometry, int jointCount)
     {
         w.U16(0x10).U16(joint);
@@ -144,7 +144,7 @@ public static class BmdWriter
         const int NormalSlot = 1;
         const int TexCoord0Slot = 5;
 
-        var w = new J3dWriter();
+        var w = new BigEndianOutput();
         w.Ascii("VTX1").U32(0);
         int formatOffset = w.Length;
         w.U32(0);
@@ -188,7 +188,7 @@ public static class BmdWriter
     /// </summary>
     private static byte[] Evp1(RiggedModel model, BmdGeometry geometry)
     {
-        var w = new J3dWriter();
+        var w = new BigEndianOutput();
         w.Ascii("EVP1").U32(0);
         w.U16(geometry.WeightSets.Count).U16(0xFFFF);
         int offsets = w.Length;
@@ -232,7 +232,7 @@ public static class BmdWriter
     /// <summary>The matrix table: for each slot, whether it is a weight set or a plain joint.</summary>
     private static byte[] Drw1(BmdGeometry geometry)
     {
-        var w = new J3dWriter();
+        var w = new BigEndianOutput();
         w.Ascii("DRW1").U32(0);
         w.U16(geometry.MatrixTable.Count).U16(0xFFFF);
         int offsets = w.Length;
@@ -256,7 +256,7 @@ public static class BmdWriter
     /// <summary>The joints: scale, rotation, translation and a bounding volume each.</summary>
     private static byte[] Jnt1(RiggedModel model)
     {
-        var w = new J3dWriter();
+        var w = new BigEndianOutput();
         w.Ascii("JNT1").U32(0);
         w.U16(model.Joints.Count).U16(0xFFFF);
         int offsets = w.Length;
@@ -306,7 +306,7 @@ public static class BmdWriter
     /// </summary>
     private static byte[] Shp1(BmdGeometry geometry)
     {
-        var w = new J3dWriter();
+        var w = new BigEndianOutput();
         w.Ascii("SHP1").U32(0);
         w.U16(geometry.Shapes.Count).U16(0xFFFF);
         int offsets = w.Length;
@@ -416,7 +416,7 @@ public static class BmdWriter
     /// The matrix index is a hardware address rather than a slot number: the transform unit holds
     /// each matrix as three rows, so slot n is addressed as 3n.
     /// </summary>
-    private static void WritePacket(J3dWriter w, BmdPacket packet)
+    private static void WritePacket(BigEndianOutput w, BmdPacket packet)
     {
         const int MaxVertices = 0xFFFF / 3 * 3;
 
@@ -453,7 +453,7 @@ public static class BmdWriter
         int materials = Math.Max(1, model.Meshes.Count);
         int textures = Math.Max(1, textureCount);
 
-        var w = new J3dWriter();
+        var w = new BigEndianOutput();
         w.Ascii("MAT3").U32(0);
         w.U16(materials).U16(0xFFFF);
         int offsets = w.Length;
@@ -573,14 +573,14 @@ public static class BmdWriter
     }
 
     /// <summary>Records where a MAT3 sub-table starts.</summary>
-    private static void Table(J3dWriter w, int offsets, int index) =>
+    private static void Table(BigEndianOutput w, int offsets, int index) =>
         w.PatchU32(offsets + index * 4, w.Length);
 
     /// <summary>
     /// One material record. Every index points at entry zero of its table, apart from the ones that
     /// name something this exporter does not use, which are 0xFFFF.
     /// </summary>
-    private static void MaterialRecord(J3dWriter w, bool textured)
+    private static void MaterialRecord(BigEndianOutput w, bool textured)
     {
         w.U8(1).U8(0).U8(0).U8(0);                      // draw order, cull, colour channels, texgens
         w.U8(0).U8(0).U8(0).U8(0);                      // TEV stages, depth compare location, depth, dither
@@ -638,7 +638,7 @@ public static class BmdWriter
     /// An indirect texturing block. Indirect texturing is off here, so this is the neutral block
     /// readers expect: a half-scale matrix and disabled stages.
     /// </summary>
-    private static void IndirectTexturing(J3dWriter w)
+    private static void IndirectTexturing(BigEndianOutput w)
     {
         w.U16(0);
         for (int i = 0; i < 9; i++)
@@ -658,7 +658,7 @@ public static class BmdWriter
     }
 
     /// <summary>A texture matrix: an identity transform with no rotation, scaling or offset.</summary>
-    private static void TextureMatrix(J3dWriter w)
+    private static void TextureMatrix(BigEndianOutput w)
     {
         w.U16(0x0100).U16(0xFFFF);
         w.F32(0.5f).F32(0.5f);                          // centre of the scale
@@ -672,7 +672,7 @@ public static class BmdWriter
     }
 
     /// <summary>Fog, switched off.</summary>
-    private static void Fog(J3dWriter w)
+    private static void Fog(BigEndianOutput w)
     {
         w.U8(0).U8(0).U16(0);                           // type none, disabled, centre
         w.F32(0).F32(0).F32(0).F32(0);                  // start, end, near and far planes
@@ -684,7 +684,7 @@ public static class BmdWriter
     /// <summary>The textures, as BTI headers plus their stored GX data.</summary>
     private static byte[] Tex1(IReadOnlyList<PicturePackTexture> textures)
     {
-        var w = new J3dWriter();
+        var w = new BigEndianOutput();
         w.Ascii("TEX1").U32(0);
         w.U16(textures.Count).U16(0xFFFF);
         int offsets = w.Length;
@@ -704,7 +704,7 @@ public static class BmdWriter
             w.Bytes(texture.Data);
             w.Align(32);
 
-            var header = new J3dWriter();
+            var header = new BigEndianOutput();
             header.U8((int)texture.Format).U8(0);
             header.U16(texture.Width).U16(texture.Height);
             header.U8((int)texture.WrapS).U8((int)texture.WrapT);
