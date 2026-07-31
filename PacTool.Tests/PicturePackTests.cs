@@ -193,7 +193,7 @@ public class SceneTableTests
         Assert.Equal("M0", records[0].Tag);
         Assert.Equal(3, records[0].VertexCount);
         Assert.Equal(1, records[0].TriangleCount);
-        Assert.Equal(list.Length + 32, records[0].DisplayList!.Length);
+        Assert.Equal(list.Length + 32, records[0].Geometry!.Length);
         Assert.Equal("shapeA.M0", records[0].FileStem);
 
         Assert.Equal(SceneRecordKind.Entry, records[1].Kind);

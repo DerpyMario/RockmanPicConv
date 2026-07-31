@@ -185,7 +185,11 @@ public static class ContentExtractor
     {
         var shapes = scene.Shapes.ToList();
         foreach (SceneRecord shape in shapes)
-            shape.Mesh = ScnMesh.Decode(shape.DisplayList!, shape.VertexCount, shape.TriangleCount);
+        {
+            shape.Mesh = shape.Kind == SceneRecordKind.SkinnedShape
+                ? ScnMesh.DecodeSkinned(shape.Geometry!, shape.VertexCount, shape.TriangleCount, shape.PrimitiveCount)
+                : ScnMesh.DecodeDisplayList(shape.Geometry!, shape.VertexCount, shape.TriangleCount);
+        }
 
         WriteText(Path.Combine(outputDirectory, "scene.txt"), scene.Describe(name), result);
         Write(Path.Combine(outputDirectory, "scene.bin"), scene.Raw, result);
@@ -193,14 +197,16 @@ public static class ContentExtractor
         int decoded = shapes.Count(s => s.Mesh is not null);
         if (shapes.Count > 0)
         {
-            options.Log($"    {shapes.Count} shape(s), {decoded} decoded to geometry, " +
-                        $"{shapes.Sum(s => s.Mesh?.Triangles.Count ?? 0):N0} triangle(s)");
+            int skinned = shapes.Count(s => s.Mesh?.Skin is not null);
+            options.Log($"    {shapes.Count} shape(s), {decoded} decoded to geometry" +
+                        (skinned > 0 ? $" ({skinned} skinned)" : "") +
+                        $", {shapes.Sum(s => s.Mesh?.Triangles.Count ?? 0):N0} triangle(s)");
         }
 
         foreach (SceneRecord shape in shapes.Where(s => s.Mesh is null))
         {
-            string message = $"shape '{shape.FileStem}': no known vertex layout reproduces its " +
-                             $"{shape.VertexCount} vertices and {shape.TriangleCount} triangles";
+            string message = $"shape '{shape.FileStem}': its {shape.VertexCount} vertices and " +
+                             $"{shape.TriangleCount} triangles do not decode under any known layout";
             result.Warnings.Add($"{name}: {message}");
             options.Log($"    note: {message}");
         }
@@ -221,6 +227,13 @@ public static class ContentExtractor
                 ObjWriter.Save(mesh, shape.FileStem, Path.Combine(geometryDirectory, stem + ".obj"));
                 result.FilesWritten++;
                 all.Add((shape.FileStem, mesh));
+
+                // Skin weights have nowhere to go in an OBJ, so they get their own table.
+                if (mesh.Skin is not null)
+                {
+                    WriteText(Path.Combine(geometryDirectory, stem + ".skin.csv"),
+                              ObjWriter.DescribeSkin(mesh), result);
+                }
             }
 
             // One combined file as well, so the whole scene can be opened in a single step.
@@ -235,7 +248,7 @@ public static class ContentExtractor
         string listDirectory = Path.Combine(outputDirectory, "displaylists");
         var listNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         foreach (SceneRecord shape in shapes)
-            Write(Path.Combine(listDirectory, Deduplicate(SafeName(shape.FileStem), listNames) + ".bin"), shape.DisplayList!, result);
+            Write(Path.Combine(listDirectory, Deduplicate(SafeName(shape.FileStem), listNames) + ".bin"), shape.Geometry!, result);
 
         foreach (SceneRecord payload in scene.Records.Where(r => r.Kind == SceneRecordKind.Payload && r.Raw.Length > 0))
             Write(Path.Combine(listDirectory, $"offset_{payload.Offset:X6}.bin"), payload.Raw, result);
