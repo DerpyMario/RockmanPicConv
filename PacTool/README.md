@@ -38,7 +38,7 @@ Verified invariants across all 203 archives:
 
 ```
 dotnet build -c Release          # produces bin/Release/net8.0/pactool
-dotnet test                      # 105 tests, from the solution root
+dotnet test                      # 152 tests, from the solution root
 ```
 
 Targets .NET 8. The tool itself has **no external dependencies** — the GX texture decoders and the
@@ -99,19 +99,20 @@ Stage0b.pac: CAPR archive, 22 member(s)
   bg.dat               Background directory, 8 entries
   enemy.dat            Enemy directory, 4 entries, 24 spawn(s)
   b0bdfblk.scn         Picture Pack, 20 texture(s) + 234,208 B scene table
+    79 shape(s), 79 decoded to geometry, 8,912 triangle(s)
   b0bstage.scn         Picture Pack, 3 texture(s) + 23,456 B scene table
+    9 shape(s), 9 decoded to geometry, 1,352 triangle(s)
   l0blight.pcp         Picture Pack, 12 texture(s)
-  d2dxxxxx.scn         Picture Pack, 2 texture(s) + 14,048 B scene table
   d2dxxxxx.mpc         MPC model, 6 node(s), root 'chn5', 3,536 B mesh data
   ...
-Wrote 383 file(s) to .../out
-  51 image(s) decoded, 0 item(s) copied verbatim
+Wrote 202 file(s) to .../out
+  51 image(s) and 88 mesh(es) decoded, 0 item(s) copied verbatim
 ```
 
 | Input | Output |
 | --- | --- |
 | `.pac` | each member, decoded into its own directory |
-| `.pcp` / `.scn` | `textures/*.png` and `textures/textures.txt`; for `.scn`, `scene.txt`, `scene.bin` and `displaylists/*.bin` |
+| `.pcp` / `.scn` | `textures/*.png` and `textures/textures.txt`; for `.scn`, `scene.txt`, `scene.bin`, `geometry/*.obj` and one combined `<name>.obj` |
 | `.mpc` | `skeleton.txt`, `skeleton.bin`, `mesh.bin` |
 | `map.dat` / `bg.dat` / `enemy.dat` | `directory.txt` and `leveldata.bin` |
 | `.bmd` / `.bdl` | `model.txt`, `sections/*.bin`, `textures/*.png` |
@@ -120,8 +121,8 @@ Wrote 383 file(s) to .../out
 | anything else | copied out verbatim |
 
 `--mips` writes every mip level (`tex.png`, `tex.mip1.png`, …) rather than only the base one;
-`--raw` keeps each texture's stored bytes next to its PNG. Yaz0-compressed input is decompressed
-before it is identified. `unpack --decode` does both jobs at once, putting the converted files in
+`--raw` keeps the stored bytes too — each texture's, and each display list's. Yaz0-compressed
+input is decompressed before it is identified. `unpack --decode` does both jobs at once, putting the converted files in
 `<dir>/decoded/` so that packing the unpack directory back up is unaffected.
 
 `info` prints the same analysis without writing anything:
@@ -182,11 +183,71 @@ texture header:
 ```
 
 The scene table of a `.scn` is a run of 32-byte records, classified by shape rather than by name:
-a **section header** (a count followed by thirty zero bytes), a **named entry** (four zero bytes
-then a name, plus a level-of-detail tag on shape entries and an RGBA colour on material entries),
-or **payload** — GX display list commands and the vertex data they index. `fbarir.scn`'s single
-shape begins `99 00 04`, a four-vertex triangle strip through vertex attribute table 1. Decoding
-those streams needs attribute descriptors that are not in the table, so they are extracted verbatim.
+a **section header** (a count followed by thirty zero bytes), a **named entry** (a name at 0x04,
+plus an RGBA colour at 0x14 on material entries), or a **shape** — a named entry whose remaining
+fields describe the GX display list stored immediately after it:
+
+```
+0x16  u16  streamBytes    bytes of display list following this record, padding included
+0x1A  u16  listBytes      streamBytes - 32
+0x1C  u16  vertexCount
+0x1E  u16  triangleCount
+```
+
+Those fields make the table walkable exactly rather than by scanning, since a shape's display list
+is skipped by its own stated length. They are also what identifies the vertex layout — see below.
+
+### GX display lists and vertex layouts
+
+A shape's geometry is a display list: the byte stream the graphics FIFO consumes. `fbarir.scn`'s
+single shape begins `99 00 04` — opcode `0x98` is a triangle strip, its low three bits select
+vertex attribute table 1, and `0x0004` is the vertex count. Every primitive in the shipped data is
+a triangle strip. `pactool` implements the full opcode set anyway (NOP, CP/XF/BP register loads,
+indexed loads, `CALL DL`, and all eight primitive shapes) because a stray unhandled opcode would
+silently corrupt a walk rather than fail it.
+
+**Where the vertex layout comes from.** On hardware a vertex's length and contents are not in the
+stream — they are in the command processor's vertex descriptor (registers `0x50`/`0x60`) and
+vertex attribute table (`0x70`/`0x80`/`0x90`), which the game writes before calling the list. The
+shipped display lists contain no register loads of their own, so the descriptors are in the game
+executable, not in these files. `pactool` recovers them from the data instead. Two layouts occur,
+differing only in the texture coordinate:
+
+| | Position | Normal | Texture coordinate | Size |
+| --- | --- | --- | --- | --- |
+| A | `s16[3]`, 8-bit fraction | `s8[3]`, 6-bit fraction | `s16[2]`, 8-bit fraction | 13 bytes |
+| B | `s16[3]`, 8-bit fraction | `s8[3]`, 6-bit fraction | `f32[2]` | 17 bytes |
+
+The normal's fraction is not a guess and not a VAT field: the hardware fixes it at 6 bits for a
+signed byte. Under that reading **all 40,806 normals** in the reference set come out unit length to
+within half a percent. The position fraction of 8 puts the models at roughly 100 units across,
+which matches the placement coordinates in `map.dat`; a different fraction would put them in the
+thousands or the hundredths.
+
+**Choosing between the two layouts**, per shape, in order of how much each test is trusted:
+
+1. The walk has to reach exactly the vertex and triangle counts the shape record declares. A wrong
+   vertex length lands on a different count or overruns the stream. This alone settles **6907 of
+   the 7902** shapes in the reference data.
+2. A display list is padded up to a multiple of 32 bytes and the record states the padded length,
+   so the bytes consumed must round up to it. That settles another **981** — the short lists, where
+   padding had been hiding the difference.
+3. Failing those, the decoded values: a normal that is not unit length, or a texture coordinate
+   that comes out as a denormal or in the thousands, means the layout is wrong. That settles the
+   last **10**.
+
+**4 shapes** are left that no layout reproduces (`atgallM3`, `obj7M0`, and `jpihex1M` twice); their
+byte counts are not consistent with any whole vertex size. They are reported and skipped rather
+than guessed at.
+
+Geometry is exported as Wavefront OBJ — one file per shape under `geometry/`, plus one combined
+file per container. Vertices are written exactly as the stream stores them, with no welding, so
+the file stays a record of the display list rather than an interpretation of it.
+
+**Character models are different.** The shape records in `c*xxxxx.scn` and `d*xxxxx.scn` set the
+word at 0x00 to 1 and carry no display list; their geometry is in some other, non-FIFO form that
+this tool does not decode. The `.mpc` mesh blob is likewise not a display list — no run of GX
+primitive opcodes appears anywhere in any of the 119 sampled files. Both are extracted verbatim.
 
 ### MPC models (`.mpc`)
 
@@ -216,9 +277,9 @@ verbatim; `TEX1` textures are decoded to PNG through the shared GX decoder, `INF
 hierarchy listing, and the names in `JNT1` and `MAT3` are resolved against it.
 
 Several `TEX1` headers may point at one shared image, because each header's image and palette
-offsets are relative to itself — that is handled. **Geometry is not reconstructed**: that needs the
-vertex attribute descriptors and the display lists read together, which is a considerably larger
-job than texture extraction and one that nothing in this repository would exercise.
+offsets are relative to itself — that is handled. **Geometry is not reconstructed**: unlike the `.scn`
+shapes, a BMD's vertex layout is stored in its own `VTX1` and `SHP1` sections rather than having to
+be recovered, but nothing in this repository would exercise the code, so it is not written.
 
 A standalone `.bti` is the same texture header at offset 0, and decodes the same way.
 
@@ -266,10 +327,14 @@ a `PIC\0` magic and 16-byte descriptors that no shipped `.pcp` has.
 - Texture decoding against `mmnt_pac_extract_full.py`'s own PNGs — **141/141**, differing only in
   the tile the reference truncates.
 - Mip-chain sizing against every texture header in the reference data — **3048/3048**.
-- `decode` over every `.pac`, `.pcp`, `.scn`, `.mpc` and `.pic` in `files.7z` — 3147 images written,
-  12 items copied verbatim (the `playdemo*.dat` input recordings, whose format is not known), no
-  crashes and no warnings.
-- 105 unit tests. The J3D and Yaz0 fixtures are constructed rather than sampled, since the
+- `decode` over every `.pac`, `.pcp`, `.scn`, `.mpc` and `.pic` in `files.7z` — 3147 images and
+  7898 meshes written, 12 items copied verbatim (the `playdemo*.dat` input recordings, whose format
+  is not known), no crashes and 4 warnings, all of them the undecodable shapes named above.
+- Geometry decoding — **7898/7902** shapes, 641,480 triangles. Spot checks hold up
+  geometrically: `roomconv.scn`'s `cube1M0` has 24 vertices at exactly 8 distinct corners, and its
+  `scballM0` is a sphere whose radius from the bounding-box centre varies only between 3.398 and
+  3.404. Across a 600-file sample of the exported OBJs, **no normal** is off unit length.
+- 152 unit tests. The J3D and Yaz0 fixtures are constructed rather than sampled, since the
   reference data contains neither.
 
 ## Notes and edge cases
@@ -305,6 +370,9 @@ src/Program.cs                  CLI
 src/Gx/GxTextureFormat.cs       GX formats: tile geometry, bit depth, mip chain sizes
 src/Gx/GxImageDecoder.cs        all eleven GX texture formats to RGBA
 src/Gx/GxPalette.cs             TLUT decoding
+src/Gx/GxVertexFormat.cs        vertex descriptor and attribute table: sizes and offsets
+src/Gx/GxDisplayList.cs         the FIFO opcode stream
+src/Gx/GxVertexReader.cs        direct attributes out of a vertex
 
 src/Imaging/Rgba32Image.cs      decoded image buffer
 src/Imaging/PngWriter.cs        dependency-free PNG encoder
@@ -313,6 +381,7 @@ src/Formats/Ascii.cs            fixed-width name fields
 src/Formats/ContentSniffer.cs   works out what a payload is
 src/Formats/PicturePack.cs      .pcp / .scn texture container
 src/Formats/SceneTable.cs       the scene description a .scn appends
+src/Formats/ScnMesh.cs          shape geometry, and the layouts its display lists use
 src/Formats/MpcModel.cs         .mpc skeleton and mesh data
 src/Formats/DataDirectory.cs    map.dat / bg.dat / enemy.dat
 src/Formats/J3dModel.cs         .bmd / .bdl
@@ -321,4 +390,21 @@ src/Formats/SoftimagePic.cs     .pic source art
 src/Formats/Yaz0.cs             Nintendo's run-length compression
 
 src/Extract/ContentExtractor.cs orchestration: what gets written where
+src/Extract/ObjWriter.cs        Wavefront OBJ output
 ```
+
+## References
+
+The GX register layouts here — the vertex descriptor and attribute table bitfields, the opcode set,
+and the per-attribute size rules — were taken from these and then checked against the data:
+
+- [*GX Programming Manual*](https://www.davidgf.net/downloads/gcwii/gx.pdf) — the graphics
+  processor's own documentation: command processor registers, the FIFO command set, texture formats.
+- [*Nintendo GameCube Architecture Guide*](https://db.hfsplay.fr/files/2019/07/04/Architecture_Guide_SCQNknY.pdf)
+  — how the pieces fit together, and where display lists sit in the pipeline.
+- [Dolphin](https://github.com/dolphin-emu/dolphin) — `VideoCommon/CPMemory.h` for the exact
+  bitfield positions, `VideoCommon/OpcodeDecoding.h` for the opcodes, and the `VertexLoader_*.h`
+  size tables for what each attribute costs in each mode. Dolphin is the reason two apparent
+  inconsistencies in this code are deliberate rather than bugs: `IA4` puts alpha in the high nibble
+  while `IA8` puts intensity in the first byte, and a normal's fixed-point fraction comes from the
+  hardware rather than from the attribute table.

@@ -125,21 +125,58 @@ public class ContentExtractorTests : IDisposable
     }
 
     [Fact]
-    public void ASceneTableIsSplitIntoItsListingAndItsCommandStreams()
+    public void ASceneTableYieldsItsListingAndItsGeometry()
     {
-        byte[] scene = new BigEndianWriter()
-            .U16(1).Zeros(30)
-            .U32(0).Field("mesh", 8).Field("M0", 4).Zeros(16)
-            .Bytes(Enumerable.Repeat((byte)0x99, 32).ToArray())
-            .ToArray();
         byte[] pack = PicturePackTests.Build(
-            [PicturePackTests.Texture("t", GxTextureFormat.Rgb5A3, 4, 4, maxLod: 0)], scene);
+            [PicturePackTests.Texture("t", GxTextureFormat.Rgb5A3, 4, 4, maxLod: 0)], Scene());
 
-        ContentExtractor.Extract("a.scn", pack, _directory, Options());
+        ExtractResult result = ContentExtractor.Extract("a.scn", pack, _directory, Options());
 
-        Assert.Contains("'mesh'", File.ReadAllText(Path.Combine(_directory, "scene.txt")));
-        Assert.Equal(scene.Length, new FileInfo(Path.Combine(_directory, "scene.bin")).Length);
-        Assert.Equal(32, new FileInfo(Path.Combine(_directory, "displaylists", "mesh.M0.bin")).Length);
+        Assert.Equal(1, result.MeshesWritten);
+        string listing = File.ReadAllText(Path.Combine(_directory, "scene.txt"));
+        Assert.Contains("'mesh'", listing);
+        Assert.Contains("3 vert, 1 tri", listing);
+        Assert.True(File.Exists(Path.Combine(_directory, "scene.bin")));
+
+        string obj = File.ReadAllText(Path.Combine(_directory, "geometry", "mesh.M0.obj"));
+        Assert.Contains("v 1 2 3", obj);
+        Assert.Contains("f 1/1/1 2/2/2 3/3/3", obj);
+
+        // One combined file too, named after the container.
+        Assert.True(File.Exists(Path.Combine(_directory, "a.obj")));
+    }
+
+    [Fact]
+    public void DisplayListsAreKeptVerbatimOnlyWhenAskedFor()
+    {
+        byte[] pack = PicturePackTests.Build(
+            [PicturePackTests.Texture("t", GxTextureFormat.Rgb5A3, 4, 4, maxLod: 0)], Scene());
+
+        ContentExtractor.Extract("a.scn", pack, Path.Combine(_directory, "plain"), Options());
+        ContentExtractor.Extract("a.scn", pack, Path.Combine(_directory, "raw"), Options(keepRaw: true));
+
+        Assert.False(Directory.Exists(Path.Combine(_directory, "plain", "displaylists")));
+        Assert.True(File.Exists(Path.Combine(_directory, "raw", "displaylists", "mesh.M0.bin")));
+    }
+
+    /// <summary>A scene table with one shape: a section header, then a shape record and its display list.</summary>
+    private static byte[] Scene()
+    {
+        var vertices = new BigEndianWriter();
+        foreach ((int x, int y, int z) in new[] { (1, 2, 3), (4, 5, 6), (7, 8, 9) })
+        {
+            vertices.U16(x * 256).U16(y * 256).U16(z * 256)     // position, 8-bit fraction
+                    .U8(0).U8(64).U8(0)                          // normal, 6-bit fraction
+                    .U16(0).U16(0);                              // texture coordinate
+        }
+
+        byte[] list = new BigEndianWriter().U8(0x98).U16(3).Bytes(vertices.ToArray()).PadTo(64).ToArray();
+        return new BigEndianWriter()
+            .U16(1).Zeros(30)
+            .U32(0).Field("mesh", 8).Field("M0", 4)
+                .Zeros(6).U16(list.Length + 32).U16(0).U16(list.Length).U16(3).U16(1)
+            .Bytes(list).Zeros(32)
+            .ToArray();
     }
 
     [Fact]
