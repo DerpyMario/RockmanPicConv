@@ -29,7 +29,8 @@ internal static class Program
 
         decode and info look inside the payloads instead of treating them as opaque:
           .pac         every member, each into its own directory
-          .pcp / .scn  Picture Pack textures to PNG, plus the .scn scene table
+          .pcp / .scn  Picture Pack textures to PNG; a .scn also yields its scene table
+                       and its GX display list geometry as Wavefront OBJ
           .mpc         skeleton hierarchy as text, plus the packed mesh data
           map/bg/enemy.dat   stage object, background and spawn directories as text
           .bmd / .bdl  J3D models: section inventory, scene graph, and TEX1 textures to PNG
@@ -41,7 +42,7 @@ internal static class Program
           -o <dir>     output directory (default: ./<input name without extension>)
           --decode     unpack also converts each member's contents, into <dir>/decoded/
           --mips       write every mip level, not only the base one
-          --raw        keep each texture's stored bytes alongside its PNG
+          --raw        keep the stored bytes too: each texture's, and each display list's
           --flat       decode writes straight into -o rather than one directory per input
           --align <n>  pad each payload up to a multiple of n bytes (default 32)
           --no-align   store payloads at their exact length
@@ -421,7 +422,8 @@ internal static class Program
     private static void ReportExtraction(ExtractResult result, string outputDirectory)
     {
         Console.WriteLine($"Wrote {result.FilesWritten:N0} file(s) to {Path.GetFullPath(outputDirectory)}");
-        Console.WriteLine($"  {result.ImagesWritten:N0} image(s) decoded, {result.Unrecognised:N0} item(s) copied verbatim");
+        Console.WriteLine($"  {result.ImagesWritten:N0} image(s) and {result.MeshesWritten:N0} mesh(es) decoded, "
+                          + $"{result.Unrecognised:N0} item(s) copied verbatim");
         if (result.Warnings.Count > 0)
             Console.WriteLine($"  {result.Warnings.Count:N0} note(s); see the lines above");
     }

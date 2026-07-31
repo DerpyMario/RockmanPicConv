@@ -150,10 +150,10 @@ public class SceneTableTests
     {
         var table = new BigEndianWriter()
             .U16(2).Zeros(30)                                       // section header
-            .U32(0).Field("shapeA", 8).Field("M0", 4).Zeros(4)
-                .Bytes([0x80, 0x80, 0x80, 0xFF]).Zeros(8)           // entry with a colour at 0x14
-            .Bytes(Enumerable.Repeat((byte)0x99, 64).ToArray())     // two records of command data
-            .U32(0).Field("shapeB", 8).Zeros(20);
+            .U32(0).Field("matA", 8).Zeros(8)
+                .Bytes([0x80, 0x80, 0x80, 0xFF]).Zeros(8)           // material: a colour at 0x14
+            .Bytes(Enumerable.Repeat((byte)0x99, 64).ToArray())     // two records of unrecognised data
+            .U32(0).Field("matB", 8).Zeros(20);
 
         SceneTable scene = SceneTable.Parse(table.ToArray(), 0x100);
 
@@ -163,17 +163,41 @@ public class SceneTableTests
         Assert.Equal(2, records[0].Count);
 
         Assert.Equal(SceneRecordKind.Entry, records[1].Kind);
-        Assert.Equal("shapeA", records[1].Name);
-        Assert.Equal("M0", records[1].Tag);
+        Assert.Equal("matA", records[1].Name);
         Assert.Equal([0x80, 0x80, 0x80, 0xFF], records[1].Field14);
-        Assert.Equal("shapeA.M0", records[1].FileStem);
+        Assert.Equal("matA", records[1].FileStem);
 
         Assert.Equal(SceneRecordKind.Payload, records[2].Kind);
         Assert.Equal(64, records[2].Raw.Length);
-        Assert.Same(records[1], records[2].Owner);
-        Assert.Single(records[1].Payloads);
 
-        Assert.Equal("shapeB", records[3].Name);
+        Assert.Equal("matB", records[3].Name);
+    }
+
+    [Fact]
+    public void AShapeRecordIsFollowedByItsDisplayListAndTheWalkSkipsIt()
+    {
+        // A shape record states the stream length, so the next record lands on a real boundary
+        // however much geometry sits between them.
+        byte[] list = new BigEndianWriter().U8(0x98).U16(3).Zeros(3 * 13).PadTo(64).ToArray();
+        var table = new BigEndianWriter()
+            .U32(0).Field("shapeA", 8).Field("M0", 4)
+                .Zeros(6).U16(list.Length + 32).U16(0).U16(list.Length).U16(3).U16(1)
+            .Bytes(list).Zeros(32)
+            .U32(0).Field("after", 8).Zeros(20);
+
+        SceneTable scene = SceneTable.Parse(table.ToArray(), 0);
+
+        List<SceneRecord> records = scene.Records.ToList();
+        Assert.Equal(SceneRecordKind.Shape, records[0].Kind);
+        Assert.Equal("shapeA", records[0].Name);
+        Assert.Equal("M0", records[0].Tag);
+        Assert.Equal(3, records[0].VertexCount);
+        Assert.Equal(1, records[0].TriangleCount);
+        Assert.Equal(list.Length + 32, records[0].DisplayList!.Length);
+        Assert.Equal("shapeA.M0", records[0].FileStem);
+
+        Assert.Equal(SceneRecordKind.Entry, records[1].Kind);
+        Assert.Equal("after", records[1].Name);
     }
 
     [Fact]

@@ -26,6 +26,9 @@ public sealed class ExtractResult
     /// <summary>Images decoded to PNG.</summary>
     public int ImagesWritten { get; set; }
 
+    /// <summary>Meshes decoded to OBJ.</summary>
+    public int MeshesWritten { get; set; }
+
     /// <summary>Items whose format was not recognised and were copied verbatim.</summary>
     public int Unrecognised { get; set; }
 
@@ -37,6 +40,7 @@ public sealed class ExtractResult
     {
         FilesWritten += other.FilesWritten;
         ImagesWritten += other.ImagesWritten;
+        MeshesWritten += other.MeshesWritten;
         Unrecognised += other.Unrecognised;
         Warnings.AddRange(other.Warnings);
     }
@@ -173,29 +177,68 @@ public static class ContentExtractor
             WriteText(Path.Combine(textureDirectory, "textures.txt"), index.ToString(), result);
 
         if (pack.Scene is { } scene)
-            ExtractScene(name, scene, outputDirectory, result);
+            ExtractScene(name, scene, outputDirectory, options, result);
     }
 
-    private static void ExtractScene(string name, SceneTable scene, string outputDirectory, ExtractResult result)
+    private static void ExtractScene(string name, SceneTable scene, string outputDirectory,
+                                     ExtractOptions options, ExtractResult result)
     {
+        var shapes = scene.Shapes.ToList();
+        foreach (SceneRecord shape in shapes)
+            shape.Mesh = ScnMesh.Decode(shape.DisplayList!, shape.VertexCount, shape.TriangleCount);
+
         WriteText(Path.Combine(outputDirectory, "scene.txt"), scene.Describe(name), result);
         Write(Path.Combine(outputDirectory, "scene.bin"), scene.Raw, result);
 
-        var payloads = scene.Records.Where(r => r.Kind == SceneRecordKind.Payload && r.Raw.Length > 0).ToList();
-        if (payloads.Count == 0)
+        int decoded = shapes.Count(s => s.Mesh is not null);
+        if (shapes.Count > 0)
+        {
+            options.Log($"    {shapes.Count} shape(s), {decoded} decoded to geometry, " +
+                        $"{shapes.Sum(s => s.Mesh?.Triangles.Count ?? 0):N0} triangle(s)");
+        }
+
+        foreach (SceneRecord shape in shapes.Where(s => s.Mesh is null))
+        {
+            string message = $"shape '{shape.FileStem}': no known vertex layout reproduces its " +
+                             $"{shape.VertexCount} vertices and {shape.TriangleCount} triangles";
+            result.Warnings.Add($"{name}: {message}");
+            options.Log($"    note: {message}");
+        }
+
+        var used = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (decoded > 0)
+        {
+            string geometryDirectory = Path.Combine(outputDirectory, "geometry");
+            Directory.CreateDirectory(geometryDirectory);
+
+            var all = new List<(string Name, ScnMesh Mesh)>();
+            foreach (SceneRecord shape in shapes)
+            {
+                if (shape.Mesh is not { } mesh)
+                    continue;
+
+                string stem = Deduplicate(SafeName(shape.FileStem), used);
+                ObjWriter.Save(mesh, shape.FileStem, Path.Combine(geometryDirectory, stem + ".obj"));
+                result.FilesWritten++;
+                all.Add((shape.FileStem, mesh));
+            }
+
+            // One combined file as well, so the whole scene can be opened in a single step.
+            ObjWriter.SaveAll(all, Path.Combine(outputDirectory, Path.GetFileNameWithoutExtension(name) + ".obj"));
+            result.FilesWritten++;
+            result.MeshesWritten += all.Count;
+        }
+
+        if (!options.KeepRaw)
             return;
 
-        string commandDirectory = Path.Combine(outputDirectory, "displaylists");
-        Directory.CreateDirectory(commandDirectory);
-        var used = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        string listDirectory = Path.Combine(outputDirectory, "displaylists");
+        var listNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (SceneRecord shape in shapes)
+            Write(Path.Combine(listDirectory, Deduplicate(SafeName(shape.FileStem), listNames) + ".bin"), shape.DisplayList!, result);
 
-        foreach (SceneRecord payload in payloads)
-        {
-            string stem = payload.Owner is null
-                ? $"offset_{payload.Offset:X6}"
-                : SafeName(payload.Owner.FileStem);
-            Write(Path.Combine(commandDirectory, Deduplicate(stem, used) + ".bin"), payload.Raw, result);
-        }
+        foreach (SceneRecord payload in scene.Records.Where(r => r.Kind == SceneRecordKind.Payload && r.Raw.Length > 0))
+            Write(Path.Combine(listDirectory, $"offset_{payload.Offset:X6}.bin"), payload.Raw, result);
     }
 
     private static void ExtractMpc(string name, byte[] data, string outputDirectory,
