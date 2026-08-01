@@ -51,6 +51,9 @@ public sealed class ExtractResult
     /// <summary>Texture banks written as TPL.</summary>
     public int TexturePacksWritten { get; set; }
 
+    /// <summary>Stage areas whose layout was written.</summary>
+    public int AreasWritten { get; set; }
+
     /// <summary>Items whose format was not recognised and were copied verbatim.</summary>
     public int Unrecognised { get; set; }
 
@@ -66,6 +69,7 @@ public sealed class ExtractResult
         ModelsWritten += other.ModelsWritten;
         AnimationsWritten += other.AnimationsWritten;
         TexturePacksWritten += other.TexturePacksWritten;
+        AreasWritten += other.AreasWritten;
         Unrecognised += other.Unrecognised;
         Warnings.AddRange(other.Warnings);
     }
@@ -167,7 +171,52 @@ public static class ContentExtractor
         if (options.ExportJ3d)
             ExportRiggedModels(payloads, outputDirectory, options, result);
 
+        ExportStageLayout(payloads, outputDirectory, options, result);
         return result;
+    }
+
+    /// <summary>
+    /// Joins the three stage blocks into one listing. They are three views of the same stage split
+    /// across three members - the foreground in <c>map.dat</c>, the background in <c>bg.dat</c>,
+    /// the enemies in <c>enemy.dat</c> - and each keeps the same list of areas, so what is actually
+    /// in an area only becomes readable once they are put side by side.
+    /// </summary>
+    public static void ExportStageLayout(IReadOnlyDictionary<string, byte[]> payloads, string outputDirectory,
+                                         ExtractOptions options, ExtractResult result)
+    {
+        if (!payloads.TryGetValue("map.dat", out byte[]? mapData))
+            return;
+
+        try
+        {
+            DataDirectory map = DataDirectory.Parse(mapData, "map.dat");
+            if (map.Level is not { } level)
+                return;
+
+            List<DataDirectoryEntry>? spawns = null;
+            if (payloads.TryGetValue("enemy.dat", out byte[]? enemyData))
+            {
+                DataDirectory enemies = DataDirectory.Parse(enemyData, "enemy.dat");
+                spawns = enemies.Entries.ToList();
+                if (spawns.Count != level.Areas.Count)
+                {
+                    result.Warnings.Add($"enemy.dat lists {spawns.Count} area(s) but map.dat has {level.Areas.Count}.");
+                    options.Log($"    note: enemy.dat lists {spawns.Count} area(s) but map.dat has {level.Areas.Count}");
+                }
+            }
+
+            Directory.CreateDirectory(outputDirectory);
+            WriteText(Path.Combine(outputDirectory, "stage.txt"),
+                      level.Describe("the stage", map.Entries, spawns), result);
+
+            options.Log($"  {"stage layout",-20} {level.Areas.Count} area(s), {level.PlacementCount:N0} placement(s)" +
+                        (spawns is null ? "" : $", {spawns.Sum(e => e.Spawns.Count)} spawn(s)"));
+        }
+        catch (PacFormatException ex)
+        {
+            result.Warnings.Add($"stage layout: {ex.Message}");
+            options.Log($"    note: stage layout: {ex.Message}");
+        }
     }
 
     /// <summary>
@@ -423,11 +472,42 @@ public static class ContentExtractor
         int spawns = directory.Entries.Sum(e => e.Spawns.Count);
         options.Log($"  {name,-20} {directory.Kind} directory, {directory.Entries.Count} entr" +
                     $"{(directory.Entries.Count == 1 ? "y" : "ies")}" +
-                    (spawns > 0 ? $", {spawns} spawn(s)" : ""));
+                    (spawns > 0 ? $", {spawns} spawn(s)" : "") +
+                    (directory.Level is { } head ? $", {head.Areas.Count} area(s), {head.PlacementCount:N0} placement(s)" : ""));
 
         WriteText(Path.Combine(outputDirectory, "directory.txt"), directory.Describe(name), result);
-        if (directory.Trailing.Length > 0)
+
+        if (directory.Level is not { } level)
+        {
+            if (options.KeepRaw && directory.Trailing.Length > 0)
+                Write(Path.Combine(outputDirectory, "trailing.bin"), directory.Trailing, result);
+
+            return;
+        }
+
+        WriteText(Path.Combine(outputDirectory, "areas.txt"), level.Describe(name, directory.Entries), result);
+        WriteText(Path.Combine(outputDirectory, "placements.csv"),
+                  level.DescribePlacements(directory.Entries), result);
+        result.AreasWritten += level.Areas.Count;
+
+        if (options.KeepRaw)
             Write(Path.Combine(outputDirectory, "leveldata.bin"), directory.Trailing, result);
+
+        // The collision boxes are only worth drawing where there are any, which means map.dat.
+        if (!directory.Entries.Any(e => e.Boxes.Count > 0))
+            return;
+
+        string layoutDirectory = Path.Combine(outputDirectory, "layout");
+        Directory.CreateDirectory(layoutDirectory);
+        foreach (StageArea area in level.Areas)
+        {
+            string path = Path.Combine(layoutDirectory, $"area{area.Index}.obj");
+            if (StageLayoutWriter.Save(area, directory.Entries, path))
+            {
+                result.FilesWritten++;
+                result.MeshesWritten++;
+            }
+        }
     }
 
     private static void ExtractJ3d(string name, byte[] data, string outputDirectory,

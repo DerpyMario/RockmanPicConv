@@ -461,6 +461,8 @@ internal static class Program
             if (extractOptions.ExportJ3d)
                 ContentExtractor.ExportRiggedModels(payloads, decodedDirectory, extractOptions, result);
 
+            ContentExtractor.ExportStageLayout(payloads, decodedDirectory, extractOptions, result);
+
             ReportExtraction(result, decodedDirectory);
             total.Add(result);
         }
@@ -670,6 +672,9 @@ internal static class Program
 
         if (result.TexturePacksWritten > 0)
             Console.WriteLine($"  {result.TexturePacksWritten:N0} TPL texture bank(s) written");
+
+        if (result.AreasWritten > 0)
+            Console.WriteLine($"  {result.AreasWritten:N0} stage area(s) laid out");
 
         if (result.Warnings.Count > 0)
             Console.WriteLine($"  {result.Warnings.Count:N0} note(s); see the lines above");

@@ -99,7 +99,7 @@ public class MpcModelTests
 public class DataDirectoryTests
 {
     [Fact]
-    public void MapEntriesCarryAsManyPlacementsAsTheirHeadAnnounces()
+    public void MapEntriesCarryAsManyCollisionBoxesAsTheirHeadAnnounces()
     {
         byte[] block = Build("map.dat", [
             Entry("b00blkmm", 0, [(14, [5f, -5f, -5f, 5f])]),
@@ -114,18 +114,19 @@ public class DataDirectoryTests
         Assert.Equal(3, parsed.Entries.Count);
 
         Assert.Equal("b00blkmm", parsed.Entries[0].Name);
-        DataDirectoryPlacement placement = Assert.Single(parsed.Entries[0].Placements);
-        Assert.Equal(14u, placement.Kind);
-        Assert.Equal([5f, -5f, -5f, 5f], placement.Bounds);
+        DataDirectoryBox box = Assert.Single(parsed.Entries[0].Boxes);
+        Assert.Equal(14u, box.Kind);
+        Assert.Equal((5f, -5f, -5f, 5f), (box.Top, box.Bottom, box.Left, box.Right));
+        Assert.Equal((10f, 10f), (box.Width, box.Height));
 
-        Assert.Equal(5u, parsed.Entries[1].Placements[0].Kind);
-        Assert.Empty(parsed.Entries[2].Placements);
+        Assert.Equal(5u, parsed.Entries[1].Boxes[0].Kind);
+        Assert.Empty(parsed.Entries[2].Boxes);
     }
 
     [Fact]
     public void EntryLengthsFollowTheTwentyPlusFortyRule()
     {
-        // 20 + placements * 40 is what every map and background entry in the shipped data measures.
+        // 20 + boxes * 40 is what every map and background entry in the shipped data measures.
         byte[] block = Build("map.dat", [
             Entry("six", 0, Enumerable.Repeat((11u, new[] { 1f, 2f, 3f, 4f }), 6).ToList()),
         ]);
@@ -133,7 +134,7 @@ public class DataDirectoryTests
         DataDirectoryEntry entry = Assert.Single(DataDirectory.Parse(block, "map.dat").Entries);
 
         Assert.Equal(20 + 6 * 40, entry.Raw.Length);
-        Assert.Equal(6, entry.Placements.Count);
+        Assert.Equal(6, entry.Boxes.Count);
     }
 
     [Fact]
