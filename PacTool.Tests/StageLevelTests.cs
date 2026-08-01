@@ -19,7 +19,8 @@ public class StageLevelTests
                      Placement(0, 55, -205, 0),
                      Placement(2, 65, -205, 0, 100, 1, 3),
                  ],
-                 backdrops: [Backdrop(0x40, 0x40, 0x40, 0xFF, [50, -265, 0, 104], 1, 16)]),
+                 backdrops: [Backdrop(0x40, 0x40, 0x40, 0xFF, [50, -265, 0, 104], 1, 16),
+                             Backdrop(0x40, 0x40, 0x40, 0xFF, [50, -265, 0, 104], 0, 1)]),
         ]);
 
         var warnings = new List<string>();
@@ -40,10 +41,67 @@ public class StageLevelTests
         Assert.Equal(new StagePlacement(2, 65, -205, 0, 100, 1, 3), area.Placements[1]);
         Assert.True(area.Placements[1].HasParameter);
 
+        // Two stored records, one backdrop: the pair shares everything but its trailing words.
+        Assert.Equal(2, area.BackdropRecords);
         StageBackdrop backdrop = Assert.Single(area.Backdrops);
         Assert.Equal((0x40, 0x40, 0x40, 0xFF), (backdrop.Red, backdrop.Green, backdrop.Blue, backdrop.Alpha));
         Assert.Equal([50f, -265f, 0f, 104f], backdrop.Values);
+        Assert.Equal((50f, -265f), (backdrop.X, backdrop.Y));
+        Assert.Equal((1u, 16u, 0u, 1u),
+                     (backdrop.FirstWordA, backdrop.FirstWordB, backdrop.SecondWordA, backdrop.SecondWordB));
+        Assert.True(backdrop.BodiesMatch);
         Assert.True(backdrop.LooksInitialised);
+        Assert.False(area.IsUnused);
+    }
+
+    [Fact]
+    public void AnUnfilledBackdropIsToldApartFromARealOne()
+    {
+        // 45 of the 182 pairs in the reference data were never written; their floats run to
+        // millions, which is what separates them from a position.
+        byte[] block = Block([
+            Area(backdrops: [
+                Backdrop(0x40, 0x40, 0x40, 0xFF, [1275334.5f, 743009.06f, 497375.47f, 43431676f], 1, 16),
+                Backdrop(0x40, 0x40, 0x40, 0xFF, [1275334.5f, 743009.06f, 497375.47f, 43431676f], 0, 1),
+                Backdrop(0x00, 0x40, 0x40, 0xFF, [50, -265, 0, 104], 1, 16),
+                Backdrop(0x00, 0x40, 0x40, 0xFF, [50, -265, 0, 104], 0, 1),
+            ]),
+        ]);
+
+        StageArea area = Assert.Single(StageLevel.Parse(block, "bg.dat", []).Areas);
+
+        Assert.Equal(2, area.Backdrops.Count);
+        Assert.False(area.Backdrops[0].LooksInitialised);
+        Assert.True(area.Backdrops[1].LooksInitialised);
+    }
+
+    [Fact]
+    public void AnAreaWithWordFourZeroIsMarkedUnused()
+    {
+        // All twelve such areas in the reference data are empty, and every implausible pointX in
+        // the corpus belongs to one of them.
+        byte[] block = Block([
+            Area(word4: 0, pointX: 30755, pointY: 160),
+            Area(word4: 2, pointX: 450, pointY: 160, placements: [Placement(0, 0, 0, 0)]),
+        ]);
+
+        StageLevel level = StageLevel.Parse(block, "map.dat", []);
+
+        Assert.True(level.Areas[0].IsUnused);
+        Assert.False(level.Areas[1].IsUnused);
+        Assert.Contains("unused", level.Describe("test", []));
+    }
+
+    [Fact]
+    public void AnOddBackdropCountIsReported()
+    {
+        byte[] block = Block([Area(backdrops: [Backdrop(1, 2, 3, 4, [0, 0, 0, 1], 1, 16)])]);
+
+        var warnings = new List<string>();
+        StageLevel level = StageLevel.Parse(block, "bg.dat", warnings);
+
+        Assert.Empty(Assert.Single(level.Areas).Backdrops);
+        Assert.Contains(warnings, w => w.Contains("does not divide into pairs"));
     }
 
     [Fact]
@@ -52,11 +110,12 @@ public class StageLevelTests
         // This is what fixes both record sizes: nothing else reproduces the stored area lengths.
         byte[] block = Block([
             Area(placements: [Placement(0, 0, 0, 0), Placement(1, 10, 0, 0), Placement(2, 20, 0, 0)],
-                 backdrops: [Backdrop(1, 2, 3, 4, [0, 0, 0, 0], 0, 1)]),
+                 backdrops: [Backdrop(1, 2, 3, 4, [0, 0, 0, 1], 1, 16),
+                             Backdrop(1, 2, 3, 4, [0, 0, 0, 1], 0, 1)]),
         ]);
 
         Assert.Equal(StageLevel.HeaderSize + 4 + StageLevel.AreaHeadSize +
-                     3 * StageLevel.PlacementSize + StageLevel.BackdropSize, block.Length);
+                     3 * StageLevel.PlacementSize + 2 * StageLevel.BackdropSize, block.Length);
         Assert.Equal(3, StageLevel.Parse(block, "map.dat", []).PlacementCount);
     }
 

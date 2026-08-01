@@ -23,11 +23,11 @@ namespace PacTool.Formats;
 /// four or five. An area is a 64-byte head and then two runs of records:
 ///
 /// <code>
-///   0x00  u32       word0       role not established
-///   0x04  u32       word1       role not established
-///   0x08  f32       pointX      a point in the placement coordinate space; role not established
-///   0x0C  f32       pointY      stored positive where placements are negative
-///   0x10  u32       word4       0, 2, 4, 6 or 7
+///   0x00  u32       word0       small integer; role not established
+///   0x04  u32       word1       small integer; role not established
+///   0x08  f32       pointX      integral; role not established
+///   0x0C  f32       pointY      integral, and may be negative
+///   0x10  u32       word4       0, 2, 4, 5, 6 or 7; zero marks an area with nothing in it
 ///   0x14  u32       stale       whatever the writing tool's buffer held
 ///   0x18  u32       placements
 ///   0x1C  u32       backdrops
@@ -58,17 +58,30 @@ namespace PacTool.Formats;
 /// in <c>map.dat</c> are a multiple of five - and the commonest collision box is ten by ten, so the
 /// stage is built from blocks on a ten-unit lattice.
 ///
-/// A backdrop record only ever appears in <c>bg.dat</c>, never in <c>map.dat</c>, and always in
-/// identical pairs. It carries an RGBA colour and four floats, of which the first two read as a
-/// position in the same space as the placements. What it drives is not established.
+/// A backdrop record only ever appears in <c>bg.dat</c>, never in <c>map.dat</c>. They come in
+/// pairs: consecutive records share their first 24 bytes in all 182 pairs in the reference data,
+/// and differ only in a trailing pair of words that takes one fixed value on the first of a pair
+/// and another on the second. Those two words therefore carry no per-record information - they
+/// discriminate the two copies - so what a backdrop actually says is a colour and four floats,
+/// written twice.
 ///
 /// <code>
 ///   0x00  u32     zero
-///   0x04  u8[4]   colour      RGBA; the alpha byte is 0xFF or 0x00
-///   0x08  f32[4]  values      the first two read as a position, the fourth as a range
-///   0x18  u32     wordA       1 on the first of a pair, 0 on the second
-///   0x1C  u32     wordB       16 on the first of a pair, 1 on the second
+///   0x04  u8[4]   colour      RGBA; the alpha byte is only ever 0xFF or 0x00
+///   0x08  f32[4]  values      the first two are a position, the third small, the fourth positive
+///   0x18  u32     wordA       1 on the first record of a pair, 0 on the second
+///   0x1C  u32     wordB       16 on the first record of a pair, 1 on the second
 /// </code>
+///
+/// 45 of the 182 pairs were never filled in - their floats run to millions, and 42 of those 45
+/// quadruples are distinct stale values that repeat verbatim across different files, which is the
+/// signature of a buffer the writing tool reused without clearing. <see cref="StageBackdrop.LooksInitialised"/>
+/// separates the two.
+///
+/// What the game does with a backdrop is not established. What it is not, checked and ruled out:
+/// it does not index the stage's <c>l??light.pcp</c>, because every stage ships the same twelve
+/// cel-shading ramps whatever its backdrop count; and it is not attached to a placed object,
+/// because the nearest placement to one is an ordinary piece of background scenery.
 /// </summary>
 public sealed class StageLevel
 {
@@ -212,25 +225,36 @@ public sealed class StageLevel
                 record[0x11], record[0x12], record[0x13]));
         }
 
+        // Backdrops come two records at a time, the second a copy of the first apart from its
+        // trailing words, so they are read as pairs rather than as twice as many records.
+        area.BackdropRecords = (int)backdrops;
         int backdropStart = AreaHeadSize + (int)placements * PlacementSize;
-        for (int i = 0; i < backdrops; i++)
+        for (int i = 0; i + 1 < backdrops; i += 2)
         {
-            ReadOnlySpan<byte> record = raw.Slice(backdropStart + i * BackdropSize, BackdropSize);
+            ReadOnlySpan<byte> first = raw.Slice(backdropStart + i * BackdropSize, BackdropSize);
+            ReadOnlySpan<byte> second = raw.Slice(backdropStart + (i + 1) * BackdropSize, BackdropSize);
+
             var values = new float[4];
             for (int v = 0; v < values.Length; v++)
-                values[v] = BinaryPrimitives.ReadSingleBigEndian(record[(8 + v * 4)..]);
+                values[v] = BinaryPrimitives.ReadSingleBigEndian(first[(8 + v * 4)..]);
 
             area.Backdrops.Add(new StageBackdrop
             {
-                Red = record[4],
-                Green = record[5],
-                Blue = record[6],
-                Alpha = record[7],
+                Red = first[4],
+                Green = first[5],
+                Blue = first[6],
+                Alpha = first[7],
                 Values = values,
-                WordA = BinaryPrimitives.ReadUInt32BigEndian(record[0x18..]),
-                WordB = BinaryPrimitives.ReadUInt32BigEndian(record[0x1C..]),
+                FirstWordA = BinaryPrimitives.ReadUInt32BigEndian(first[0x18..]),
+                FirstWordB = BinaryPrimitives.ReadUInt32BigEndian(first[0x1C..]),
+                SecondWordA = BinaryPrimitives.ReadUInt32BigEndian(second[0x18..]),
+                SecondWordB = BinaryPrimitives.ReadUInt32BigEndian(second[0x1C..]),
+                BodiesMatch = first[..0x18].SequenceEqual(second[..0x18]),
             });
         }
+
+        if (backdrops % 2 != 0)
+            warnings.Add($"area {index} has {backdrops} backdrop record(s), which does not divide into pairs.");
 
         _ = blockName;
         return area;
@@ -251,7 +275,8 @@ public sealed class StageLevel
         foreach (StageArea area in Areas)
         {
             text.AppendLine($"[area {area.Index}] @0x{area.Offset:X4}  " +
-                            $"{area.Placements.Count:N0} placement(s), {area.Backdrops.Count} backdrop(s)");
+                            $"{area.Placements.Count:N0} placement(s), {area.Backdrops.Count} backdrop(s)" +
+                            (area.IsUnused ? "  -- unused: word4 is zero, so the head below is leftovers" : ""));
             text.AppendLine($"         point=({F(area.PointX)}, {F(area.PointY)})  " +
                             $"word0={area.Word0}  word1={area.Word1}  word4={area.Word4}");
 
@@ -279,8 +304,11 @@ public sealed class StageLevel
             }
 
             foreach (StageBackdrop backdrop in area.Backdrops)
+            {
                 text.AppendLine($"    backdrop  #{backdrop.Red:X2}{backdrop.Green:X2}{backdrop.Blue:X2}{backdrop.Alpha:X2}" +
-                                $"  [{string.Join(", ", backdrop.Values.Select(F))}]");
+                                $"  [{string.Join(", ", backdrop.Values.Select(F))}]" +
+                                (backdrop.LooksInitialised ? "" : "  -- never filled in"));
+            }
 
             text.AppendLine();
         }
@@ -339,14 +367,29 @@ public sealed class StageArea
     /// <summary>Head float at 0x0C, stored positive where placement y is negative.</summary>
     public float PointY { get; set; }
 
-    /// <summary>Head word at 0x10: 0, 2, 4, 6 or 7 in the reference data. Role not established.</summary>
+    /// <summary>
+    /// Head word at 0x10: 0, 2, 4, 5, 6 or 7 in the reference data. What it selects is not
+    /// established, but zero is not a mode - see <see cref="IsUnused"/>.
+    /// </summary>
     public uint Word4 { get; set; }
+
+    /// <summary>
+    /// True when this area holds nothing. All twelve areas in the reference data with
+    /// <see cref="Word4"/> of zero carry at most one placement, and every implausible
+    /// <see cref="PointX"/> in the corpus - up to 30,755 where the rest sit between 334 and 2401 -
+    /// belongs to one of them, so their head values are the writing tool's leftovers rather than
+    /// anything the game reads.
+    /// </summary>
+    public bool IsUnused => Word4 == 0;
 
     /// <summary>What is placed in this area.</summary>
     public List<StagePlacement> Placements { get; } = [];
 
-    /// <summary>Backdrop records, which only <c>bg.dat</c> carries.</summary>
+    /// <summary>Backdrops, which only <c>bg.dat</c> carries. One entry per stored pair.</summary>
     public List<StageBackdrop> Backdrops { get; } = [];
+
+    /// <summary>Backdrop records the head announced, which is twice <see cref="Backdrops"/>.</summary>
+    public int BackdropRecords { get; set; }
 }
 
 /// <summary>One placed object: which asset, and where.</summary>
@@ -366,9 +409,9 @@ public readonly record struct StagePlacement(
 }
 
 /// <summary>
-/// A record that only <c>bg.dat</c> carries: a colour and four floats, written in identical pairs.
-/// A good number of them are uninitialised - their floats run to millions - so what the game does
-/// with them is reported rather than interpreted.
+/// One backdrop of a <c>bg.dat</c> area: a colour and four floats, stored twice. The two stored
+/// records are identical apart from their trailing words, so this holds the shared body once and
+/// both suffixes.
 /// </summary>
 public sealed class StageBackdrop
 {
@@ -381,19 +424,45 @@ public sealed class StageBackdrop
     /// <summary>Blue channel.</summary>
     public required byte Blue { get; init; }
 
-    /// <summary>Alpha channel: 0xFF or 0x00 throughout.</summary>
+    /// <summary>Alpha channel: only ever 0xFF or 0x00.</summary>
     public required byte Alpha { get; init; }
 
-    /// <summary>The four floats. The first two read as a position, the fourth as a range.</summary>
+    /// <summary>
+    /// The four floats. The first two are a position in the area's own space, the third is small
+    /// and often exactly zero, and the fourth is positive - between 43 and 160 for most of them.
+    /// </summary>
     public required float[] Values { get; init; }
 
-    /// <summary>Word at 0x18: 1 on the first record of a pair, 0 on the second.</summary>
-    public required uint WordA { get; init; }
+    /// <summary>Word at 0x18 of the first record. 1 throughout the reference data.</summary>
+    public required uint FirstWordA { get; init; }
 
-    /// <summary>Word at 0x1C: 16 on the first record of a pair, 1 on the second.</summary>
-    public required uint WordB { get; init; }
+    /// <summary>Word at 0x1C of the first record. 16 throughout the reference data.</summary>
+    public required uint FirstWordB { get; init; }
 
-    /// <summary>True when the floats are finite and small enough to be a position rather than junk.</summary>
+    /// <summary>Word at 0x18 of the second record. 0, or 2 in two of the 182 pairs.</summary>
+    public required uint SecondWordA { get; init; }
+
+    /// <summary>Word at 0x1C of the second record. 1 throughout the reference data.</summary>
+    public required uint SecondWordB { get; init; }
+
+    /// <summary>True when the two stored records really did share their first 24 bytes.</summary>
+    public required bool BodiesMatch { get; init; }
+
+    /// <summary>Horizontal position.</summary>
+    public float X => Values[0];
+
+    /// <summary>Vertical position; negative, like every other stage coordinate.</summary>
+    public float Y => Values[1];
+
+    /// <summary>
+    /// True when all four floats sit inside the ranges the stage coordinate space uses. 45 of the
+    /// 182 pairs in the reference data fail this: they were never filled in, and their values are
+    /// stale buffer contents that repeat verbatim across different files.
+    /// </summary>
     public bool LooksInitialised =>
-        Values.All(v => float.IsFinite(v) && Math.Abs(v) < 100_000f);
+        Values.All(float.IsFinite) &&
+        Math.Abs(Values[0]) < 20_000f &&
+        Values[1] is > -6_000f and < 3_000f &&
+        Math.Abs(Values[2]) < 1_000f &&
+        Values[3] is > 0f and < 3_000f;
 }
