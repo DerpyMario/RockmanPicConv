@@ -38,7 +38,7 @@ Verified invariants across all 203 archives:
 
 ```
 dotnet build -c Release          # produces bin/Release/net8.0/pactool
-dotnet test                      # 219 tests, from the solution root
+dotnet test                      # 231 tests, from the solution root
 ```
 
 Targets .NET 8. The tool itself has **no external dependencies** — the GX texture decoders and the
@@ -137,8 +137,8 @@ above; the stated `size` includes the padding. Use `--no-align` for exact length
 ```
 $ pactool decode files/StageData/Stage0b.pac -o out
 Stage0b.pac: CAPR archive, 22 member(s)
-  map.dat              Map directory, 36 entries
-  bg.dat               Background directory, 8 entries
+  map.dat              Map directory, 36 entries, 4 area(s), 1,116 placement(s)
+  bg.dat               Background directory, 8 entries, 4 area(s), 666 placement(s)
   enemy.dat            Enemy directory, 4 entries, 24 spawn(s)
   b0bdfblk.scn         Picture Pack, 20 texture(s) + 234,208 B scene table
     79 shape(s), 79 decoded to geometry, 8,912 triangle(s)
@@ -149,10 +149,12 @@ Stage0b.pac: CAPR archive, 22 member(s)
     2 shape(s), 2 decoded to geometry (2 skinned), 464 triangle(s)
   d2dxxxxx.mpc         MPC skeleton, 6 joint(s), root 'chn5', 1 motion(s)
   d2dxxxxx (rigged)    6 joint(s), 1 posed, 2 mesh(es), 1 motion(s)
+  stage layout         4 area(s), 1,116 placement(s), 24 spawn(s)
   ...
-Wrote 300 file(s) to .../out
-  51 image(s) and 104 mesh(es) decoded, 0 item(s) copied verbatim
+Wrote 305 file(s) to .../out
+  51 image(s) and 107 mesh(es) decoded, 0 item(s) copied verbatim
   8 J3D model(s) and 34 animation(s) written
+  8 stage area(s) laid out
 ```
 
 | Input | Output |
@@ -161,7 +163,9 @@ Wrote 300 file(s) to .../out
 | `.pcp` / `.scn` | `textures/*.png` and `textures/textures.txt`; for `.scn`, `scene.txt`, `scene.bin`, `geometry/*.obj` (plus `.skin.csv` for character models) and one combined `<name>.obj` |
 | `.mpc` | `skeleton.txt`, `skeleton.bin`, `motions.txt` and `animation/*.bck` |
 | `<stem>.model/` | `skeleton.txt`, `<stem>.bmd`, `motions.txt` and `animation/*.bck` — the assembled character |
-| `map.dat` / `bg.dat` / `enemy.dat` | `directory.txt` and `leveldata.bin` |
+| `map.dat` / `bg.dat` | `directory.txt`, `areas.txt`, `placements.csv`, and `layout/area*.obj` for the collision boxes |
+| `enemy.dat` | `directory.txt`, one spawn list per area |
+| a stage archive | `stage.txt`: the layout and the enemy spawns side by side |
 | `.bmd` / `.bdl` | `model.txt`, `sections/*.bin`, `textures/*.png` |
 | `.bti` | `<name>.png` |
 | `.pic` | `<name>.png` |
@@ -410,18 +414,98 @@ dictionary, because a skeleton repeats a name for a mirrored limb. Over the refe
 5608 joints in 178 models find one; the rest are mostly `eff*` effect nodes, and are exported at
 the origin with a warning saying how many.
 
-### Stage directories (`map.dat`, `bg.dat`, `enemy.dat`)
+### Stage data (`map.dat`, `bg.dat`, `enemy.dat`)
 
-A size, a count, an offset table, then variable-length entries. `map.dat` and `bg.dat` share an
-entry format: a 20-byte head with a name and a placement count, then that many 40-byte placements,
-each a kind and four floats. `bg.dat` only names assets, so its counts are always zero and its
-entries always 20 bytes. An `enemy.dat` entry is a spawn count followed by 24-byte records, each a
-three-character model reference and five floats.
+A stage is described by three members, and each of them is **two containers back to back** — a
+directory of assets, then the layout that places them. Both halves use the same header: a size, a
+count, then that many offsets relative to `0x08`.
 
-Both sizes are confirmed against the data rather than assumed: `20 + placements * 40` reproduces
-the stored length of **all 1373** map and background entries, and `4 + spawns * 24` **all 82** enemy
-entries. Everything past the directory is the level data proper, a separate format extracted
-verbatim to `leveldata.bin`.
+**The directory** names what the stage is built from. `map.dat` and `bg.dat` share an entry format:
+a 20-byte head with a name and a count, then that many 40-byte records. `bg.dat` only names assets,
+so its counts are always zero and its entries always 20 bytes.
+
+```
+0x00  u16       flags     0x1000 throughout bg.dat, 0 in map.dat
+0x02  char[8]   name
+0x0A  u8[6]     reserved  zero in all 1373 entries
+0x10  u32       boxes
+0x14  ...       box[boxes], 40 bytes each:
+                  0x00  u32  kind       5, 6, 11 to 15
+                  0x08  f32  top
+                  0x0C  f32  bottom
+                  0x10  f32  left
+                  0x14  f32  right
+                  0x18  u32  parameter  only kind 5 sets it: 200, 2 or 40
+```
+
+Those four floats are a **collision box in the asset's own space**, not a position. `top` is at or
+above `bottom` and `left` at or below `right` in 840 of the 842 boxes, and the commonest size is
+exactly ten by ten — the block the stages are built from.
+
+**The layout** is what follows, and it divides the stage into **areas** — four or five of them,
+one per screen-sized region. An area is a 64-byte head and two runs of records:
+
+```
+0x00  u32  word0       role not established
+0x04  u32  word1       role not established
+0x08  f32  pointX      a point in the placement coordinate space; role not established
+0x0C  f32  pointY      stored positive where placements are negative
+0x10  u32  word4       0, 2, 4, 6 or 7
+0x14  u32  stale       whatever the writing tool's buffer held
+0x18  u32  placements
+0x1C  u32  backdrops
+0x20  u8[32]  zero, then more stale buffer
+0x40  ...  placement[placements], 20 bytes each
+...        backdrop[backdrops], 32 bytes each
+
+placement:
+0x00  u8      entry      index into the directory in front of this block
+0x01  u8[3]   stale
+0x04  f32     x
+0x08  f32     y          negative: the stage hangs below the origin
+0x0C  f32     z          0 throughout map.dat, the parallax depth in bg.dat
+0x10  u8      zero
+0x11  u8[3]   parameter  object-specific, and zero on 98% of placements
+```
+
+`64 + placements * 20 + backdrops * 32` reproduces the length of **all 180 areas** exactly, which
+is what fixes both record sizes.
+
+**The entry index is what joins the two halves**, and it is not a guess: in 38 of the 44 blocks
+that have a layout the highest index used is *exactly* one less than the number of directory
+entries. Positions land on a five-unit editor grid — 31,812 of the 31,866 coordinates in `map.dat`
+are a multiple of five.
+
+**`enemy.dat` is the same shape**, and its entries are the areas: one spawn list each, and the
+count matches the layout's area count in all 20 stages that have both. A spawn is a count then
+24-byte records:
+
+```
+0x00  u8      flags   0 throughout
+0x01  char[3] model   the stem of a model in the same archive: 'D2d' is d2dxxxxx.scn/.mpc
+0x04  f32     x
+0x08  f32     y
+0x0C  f32     z       0 throughout
+0x10  f32     facing  -1 left, +1 right, and nothing else occurs
+0x14  f32     reserved
+```
+
+Entry sizes are confirmed against the data rather than assumed: `20 + boxes * 40` reproduces the
+stored length of **all 1373** map and background entries, and `4 + spawns * 24` **all 82** enemy
+entries.
+
+The one record left unexplained is the **backdrop**, which only `bg.dat` carries, never `map.dat`,
+and always in identical pairs. It holds an RGBA colour and four floats of which the first two read
+as a position; a quarter of them are uninitialised, their floats running to millions. The layout is
+reported, the meaning is not claimed.
+
+**What the export gives you.** `areas.txt` lists every area with each placement resolved to its
+asset name, `placements.csv` is the same thing machine-readable, and `stage.txt` at the archive
+root puts the foreground layout and the enemy spawns side by side. `layout/area*.obj` draws each
+area's collision boxes where the layout puts them — which is also the check on the whole chain:
+if the four floats were anything other than a box, or the index anything other than a directory
+entry, the result would be a heap rather than a stage. Across the corpus it comes out as
+**15,647 axis-aligned rectangles with 1% overlap** — the stages tile.
 
 ### J3D models (`.bmd`, `.bdl`)
 
@@ -567,8 +651,8 @@ a `PIC\0` magic and 16-byte descriptors that no shipped `.pcp` has.
 - Texture decoding against `mmnt_pac_extract_full.py`'s own PNGs — **141/141**, differing only in
   the tile the reference truncates.
 - Mip-chain sizing against every texture header in the reference data — **3048/3048**.
-- `decode files -r --tpl` over the whole reference tree — 19,475 files written, 3147 images and
-  8536 meshes, 12 items copied verbatim (the `playdemo*.dat` input recordings, whose format is not
+- `decode files -r --tpl` over the whole reference tree — 19,587 files written, 3147 images and
+  8597 meshes, 12 items copied verbatim (the `playdemo*.dat` input recordings, whose format is not
   known), no crashes and 197 notes: 178 saying how many joints of a model have no rest pose, and 19
   motions that do not fit before the next one.
 - Geometry decoding — **8536/8536** shapes, 641,480 triangles. Spot checks hold up
@@ -584,7 +668,12 @@ a `PIC\0` magic and 16-byte descriptors that no shipped `.pcp` has.
   PNG this tool wrote from the same source: **791/791** valid and **3147/3147** pixel-identical.
   That covers the 99 Softimage PIC files too, which are the only ones encoded rather than copied,
   so it is also the round-trip check on the RGBA8 encoder.
-- 219 unit tests. The J3D, TPL and Yaz0 fixtures are constructed rather than sampled, since the
+- Stage layout — every one of the 180 areas in the corpus is exactly
+  `64 + placements * 20 + backdrops * 32` bytes, every `enemy.dat` has one entry per area, and
+  drawing each area's collision boxes where the layout puts them gives **15,647 axis-aligned
+  rectangles covering 145,751 grid cells with 1% overlap**: the stages tile, which nothing but the
+  right reading of the box and the index would produce.
+- 231 unit tests. The J3D, TPL and Yaz0 fixtures are constructed rather than sampled, since the
   reference data contains neither; the BMD writer is checked by reading its output back through
   this repository's own J3D reader, and the BCK and TPL writers through separate readers in the
   tests.
@@ -641,7 +730,8 @@ src/Formats/ScnNode.cs          joint rest poses and inverse bind matrices
 src/Formats/MpcModel.cs         .mpc joint table
 src/Formats/MpcMotion.cs        the motion directory and its uncompressed frames
 src/Formats/RiggedModel.cs      joins a .scn and a .mpc into one posable character
-src/Formats/DataDirectory.cs    map.dat / bg.dat / enemy.dat
+src/Formats/DataDirectory.cs    map.dat / bg.dat / enemy.dat: the asset directory
+src/Formats/StageLevel.cs       the stage layout that follows it: areas and placements
 src/Formats/J3dModel.cs         .bmd / .bdl
 src/Formats/BtiTexture.cs       BTI texture header, standalone and inside TEX1
 src/Formats/SoftimagePic.cs     .pic source art
@@ -658,6 +748,7 @@ src/Cli/ConsoleSession.cs       telling a dropped run from one typed at a prompt
 
 src/Extract/ContentExtractor.cs orchestration: what gets written where
 src/Extract/ObjWriter.cs        Wavefront OBJ output
+src/Extract/StageLayoutWriter.cs  a stage area's collision boxes as OBJ
 ```
 
 ## References
