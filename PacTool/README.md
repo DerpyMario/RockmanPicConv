@@ -38,7 +38,7 @@ Verified invariants across all 203 archives:
 
 ```
 dotnet build -c Release          # produces bin/Release/net8.0/pactool
-dotnet test                      # 231 tests, from the solution root
+dotnet test                      # 234 tests, from the solution root
 ```
 
 Targets .NET 8. The tool itself has **no external dependencies** — the GX texture decoders and the
@@ -494,10 +494,61 @@ Entry sizes are confirmed against the data rather than assumed: `20 + boxes * 40
 stored length of **all 1373** map and background entries, and `4 + spawns * 24` **all 82** enemy
 entries.
 
-The one record left unexplained is the **backdrop**, which only `bg.dat` carries, never `map.dat`,
-and always in identical pairs. It holds an RGBA colour and four floats of which the first two read
-as a position; a quarter of them are uninitialised, their floats running to millions. The layout is
-reported, the meaning is not claimed.
+### Backdrops, and the area head
+
+Two things in the layout resisted a full reading, so here is exactly what is established about each
+and what was ruled out getting there.
+
+**Backdrops** appear only in `bg.dat`, never in `map.dat`, and they come in **pairs**: consecutive
+records share their first 24 bytes in all 182 pairs, and differ only in a trailing pair of words
+that takes `(1, 16)` on the first record and `(0, 1)` on the second — 180 of 182, the other two
+`(2, 1)`. Those words therefore carry no per-record information; they discriminate the two copies.
+So what a backdrop says is a colour and four floats, stored twice.
+
+```
+0x00  u32     zero
+0x04  u8[4]   colour   RGBA; the alpha byte is only ever 0xFF or 0x00
+0x08  f32     x        a position in the area's own space
+0x0C  f32     y
+0x10  f32     small, and exactly zero on a third of them
+0x14  f32     positive, between 43 and 160 for most
+0x18  u32     1 on the first record of a pair, 0 on the second
+0x1C  u32     16 on the first, 1 on the second
+```
+
+**45 of the 182 pairs were never filled in.** Their floats run to millions, and 42 of those 45
+quadruples are distinct stale values that repeat verbatim across different files — the signature of
+a buffer the writing tool reused without clearing. `areas.txt` marks them rather than pretending
+they are data.
+
+What a backdrop *does* is not established, and two plausible readings were checked and ruled out:
+
+- It does not index the stage's `l??light.pcp`. That pack looked like the answer — twelve textures
+  named `cels`, `diff`, `cpa1`…`cpab`, each in an `h` and a `v` variant — but **every stage ships
+  the identical twelve**, whatever its backdrop count, so nothing can be indexing it.
+- It is not attached to a placed object. The nearest placement to a backdrop is an ordinary piece
+  of background scenery, and only one of 113 sits exactly on one.
+
+**The area head** keeps five fields whose roles are not established: two small integers, two
+integral floats, and a selector. One thing about it *is* settled: **`word4` of zero marks an area
+with nothing in it.** All twelve such areas carry at most one placement, and every implausible
+`pointX` in the corpus — up to 30,755, where the rest sit between 334 and 2401 — belongs to one of
+them. So those values are leftovers, and the listing says so.
+
+The rest was searched for rather than guessed at, and did not turn up:
+
+| Reading tested | Result |
+| --- | --- |
+| Any count from the area's own contents (placements, distinct entries, backdrops) | best 25 of 180 |
+| Any geometric extent — min, max, span, with and without the collision boxes | **0** exact of 73 real areas |
+| A cell grid, `word0 == f(extent / cell)`, scanned over cells 8–400 with floor/ceil/round and two offsets | best 42 of 100 |
+| The camera distance, tested as a correlation with the area's background depth | r ≈ −0.35 |
+| A marker for some placed object | 0 exact hits; median distance 138 units |
+
+What *is* known: all five are area properties rather than file properties — `map.dat` and `bg.dat`
+agree on `pointX`/`pointY` in 89 of 90 areas and on `word4` in 90 of 90 — the floats are always
+integral, `pointY` can be negative, and `word4`'s value shifts the range `pointY` takes, which is
+what a mode selector would do.
 
 **What the export gives you.** `areas.txt` lists every area with each placement resolved to its
 asset name, `placements.csv` is the same thing machine-readable, and `stage.txt` at the archive
@@ -672,8 +723,10 @@ a `PIC\0` magic and 16-byte descriptors that no shipped `.pcp` has.
   `64 + placements * 20 + backdrops * 32` bytes, every `enemy.dat` has one entry per area, and
   drawing each area's collision boxes where the layout puts them gives **15,647 axis-aligned
   rectangles covering 145,751 grid cells with 1% overlap**: the stages tile, which nothing but the
-  right reading of the box and the index would produce.
-- 231 unit tests. The J3D, TPL and Yaz0 fixtures are constructed rather than sampled, since the
+  right reading of the box and the index would produce. Backdrops divide into 182 pairs with no
+  record left over, 137 of which are filled in; 12 areas are marked unused by a zero `word4`, and
+  they are exactly the ones holding the corpus's implausible head values.
+- 234 unit tests. The J3D, TPL and Yaz0 fixtures are constructed rather than sampled, since the
   reference data contains neither; the BMD writer is checked by reading its output back through
   this repository's own J3D reader, and the BCK and TPL writers through separate readers in the
   tests.
